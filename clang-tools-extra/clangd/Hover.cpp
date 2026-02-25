@@ -1248,26 +1248,63 @@ std::string getModuleImportDocumentation(const ImportDecl &ID,
 
   auto PrevTok = Lexer::findPreviousToken(DefLoc, SM, ASTCtx.getLangOpts(),
                                           /*IncludeComments=*/true);
-  if (!PrevTok)
-    return "";
-  if (PrevTok->is(tok::kw_export)) {
+  while (PrevTok && (PrevTok->is(tok::kw_export) || PrevTok->is(tok::kw_module) ||
+                     PrevTok->is(tok::identifier) || PrevTok->is(tok::period) ||
+                     PrevTok->is(tok::colon))) {
     PrevTok = Lexer::findPreviousToken(PrevTok->getLocation(), SM,
                                        ASTCtx.getLangOpts(),
                                        /*IncludeComments=*/true);
-    if (!PrevTok)
-      return "";
   }
-  if (!PrevTok->is(tok::comment))
-    return "";
+  if (PrevTok && PrevTok->is(tok::comment)) {
+    RawComment RC(SM, SourceRange(PrevTok->getLocation(), PrevTok->getEndLoc()),
+                  ASTCtx.getLangOpts().CommentOpts, /*Merged=*/false);
+    if (RC.isDocumentation()) {
+      std::string Doc = RC.getFormattedText(SM, ASTCtx.getDiagnostics());
+      if (looksLikeDocComment(Doc))
+        return Doc;
+    }
+  }
 
-  RawComment RC(SM, SourceRange(PrevTok->getLocation(), PrevTok->getEndLoc()),
-                ASTCtx.getLangOpts().CommentOpts, /*Merged=*/false);
-  if (!RC.isDocumentation())
+  const auto SourcePath = SM.getFilename(DefLoc);
+  if (SourcePath.empty())
     return "";
-  std::string Doc = RC.getFormattedText(SM, ASTCtx.getDiagnostics());
-  if (!looksLikeDocComment(Doc))
+  auto BufferOrErr = SM.getFileManager().getBufferForFile(SourcePath);
+  if (!BufferOrErr)
     return "";
-  return Doc;
+  StringRef Buffer = (*BufferOrErr)->getBuffer();
+
+  const std::string ModuleName = Imported->getFullModuleName();
+  SmallVector<StringRef, 8> Lines;
+  Buffer.split(Lines, '\n');
+  for (size_t I = 0; I < Lines.size(); ++I) {
+    StringRef DeclLine = Lines[I].ltrim(" \t");
+    if (!DeclLine.starts_with("module") && !DeclLine.starts_with("export"))
+      continue;
+    if (!DeclLine.contains("module") || !DeclLine.contains(ModuleName))
+      continue;
+    if (I == 0)
+      return "";
+
+    SmallVector<StringRef, 4> DocLines;
+    for (int Line = static_cast<int>(I) - 1; Line >= 0; --Line) {
+      StringRef Trimmed = Lines[Line].ltrim(" \t");
+      if (!Trimmed.starts_with("///") && !Trimmed.starts_with("//!"))
+        break;
+      Trimmed = Trimmed.drop_front(3).ltrim(" \t").rtrim(" \r");
+      DocLines.push_back(Trimmed);
+    }
+    if (DocLines.empty())
+      return "";
+
+    std::string Doc;
+    for (int J = static_cast<int>(DocLines.size()) - 1; J >= 0; --J) {
+      Doc.append(DocLines[J].begin(), DocLines[J].end());
+      if (J != 0)
+        Doc.push_back('\n');
+    }
+    return Doc;
+  }
+  return "";
 }
 
 const ImportDecl *locateModuleImport(const syntax::Token &Tok, ParsedAST &AST) {
@@ -1300,7 +1337,7 @@ std::optional<HoverInfo> getHoverContents(const ImportDecl &ID,
   HI.Name = Imported->getFullModuleName();
   HI.Kind = index::SymbolKind::Module;
   HI.Documentation = std::move(Documentation);
-  HI.Definition = "module " + Imported->getFullModuleName().str();
+  HI.Definition = "module " + Imported->getFullModuleName();
   return HI;
 }
 
