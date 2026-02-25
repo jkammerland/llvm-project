@@ -196,6 +196,28 @@ TEST_F(ShouldCollectSymbolTest, CollectLocalClassesAndVirtualMethods) {
   EXPECT_FALSE(shouldCollect("Local", /*Qualified=*/false));
 }
 
+TEST_F(ShouldCollectSymbolTest, ExportUsingDecl) {
+  File.Filename = "f.cppm";
+  File.ExtraArgs = {"-std=c++20"};
+  File.AdditionalFiles["foo.h"] = "void printA();";
+  build("", R"cpp(
+    module;
+    #include "foo.h"
+    export module A;
+    export using ::printA;
+  )cpp");
+
+  const NamedDecl &ND = findDecl(
+      *AST, std::function<bool(const NamedDecl &)>([](const NamedDecl &ND) {
+        const auto *UD = llvm::dyn_cast<UsingDecl>(&ND);
+        return UD && UD->getName() == "printA";
+      }));
+  const SourceManager &SM = AST->getSourceManager();
+  EXPECT_TRUE(SymbolCollector::shouldCollectSymbol(
+      ND, AST->getASTContext(), SymbolCollector::Options(),
+      isInsideMainFile(ND.getBeginLoc(), SM)));
+}
+
 TEST_F(ShouldCollectSymbolTest, NoPrivateProtoSymbol) {
   HeaderName = "f.proto.h";
   build(
