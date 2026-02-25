@@ -92,8 +92,7 @@ public:
 
   // We shouldn't adjust the compilation commands based on
   // FailedPrerequisiteModules.
-  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {
-  }
+  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {}
 
   // FailedPrerequisiteModules can never be reused.
   bool
@@ -188,7 +187,13 @@ public:
 // are owned by the modules builder.
 class ReusablePrerequisiteModules : public PrerequisiteModules {
 public:
-  ReusablePrerequisiteModules() = default;
+  ReusablePrerequisiteModules(
+      PathRef MainFile, const GlobalCompilationDatabase &CDB,
+      llvm::ArrayRef<std::string> DirectRequiredModuleNames)
+      : MainFile(MainFile.str()), CDB(&CDB) {
+    for (llvm::StringRef ModuleName : DirectRequiredModuleNames)
+      this->DirectRequiredModuleNames.insert(ModuleName);
+  }
 
   ReusablePrerequisiteModules(const ReusablePrerequisiteModules &Other) =
       default;
@@ -231,7 +236,30 @@ public:
   }
 
 private:
+  bool hasSameRequiredModules() const {
+    auto ProjectModules = CDB->getProjectModules(MainFile);
+    if (!ProjectModules)
+      return false;
+
+    llvm::StringSet<> CurrentRequiredModuleNames;
+    for (llvm::StringRef ModuleName :
+         ProjectModules->getRequiredModules(MainFile))
+      CurrentRequiredModuleNames.insert(ModuleName);
+
+    if (CurrentRequiredModuleNames.size() != DirectRequiredModuleNames.size())
+      return false;
+
+    for (llvm::StringRef ModuleName : DirectRequiredModuleNames.keys()) {
+      if (!CurrentRequiredModuleNames.contains(ModuleName))
+        return false;
+    }
+    return true;
+  }
+
   llvm::SmallVector<std::shared_ptr<const ModuleFile>, 8> RequiredModules;
+  std::string MainFile;
+  const GlobalCompilationDatabase *CDB = nullptr;
+  llvm::StringSet<> DirectRequiredModuleNames;
   // A helper class to speedup the query if a module is built.
   llvm::StringSet<> BuiltModuleNames;
 };
@@ -386,6 +414,9 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
 bool ReusablePrerequisiteModules::canReuse(
     const CompilerInvocation &CI,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) const {
+  if (!hasSameRequiredModules())
+    return false;
+
   if (RequiredModules.empty())
     return true;
 
@@ -663,10 +694,10 @@ ModulesBuilder::buildPrerequisiteModulesFor(PathRef File,
 
   std::vector<std::string> RequiredModuleNames =
       CachedMDB.getRequiredModules(File);
+  auto RequiredModules = std::make_unique<ReusablePrerequisiteModules>(
+      File, Impl->getCDB(), RequiredModuleNames);
   if (RequiredModuleNames.empty())
-    return std::make_unique<ReusablePrerequisiteModules>();
-
-  auto RequiredModules = std::make_unique<ReusablePrerequisiteModules>();
+    return RequiredModules;
   for (llvm::StringRef RequiredModuleName : RequiredModuleNames) {
     // Return early if there is any error.
     if (llvm::Error Err = Impl->getOrBuildModuleFile(
