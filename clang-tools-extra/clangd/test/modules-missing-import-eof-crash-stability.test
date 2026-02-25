@@ -1,6 +1,7 @@
-# Regression test for #181358.
+# Stability regression test for #181358.
 #
-# Missing module import at EOF used to crash clangd when parsing stopped early.
+# Missing module import at EOF must not crash clangd, even across repeated
+# async update/sync cycles.
 #
 # UNSUPPORTED: system-windows
 #
@@ -14,7 +15,8 @@
 #
 # RUN: clangd -experimental-modules-support -lit-test -sync=0 < %t/definition.jsonrpc \
 # RUN:      2> %t.err | tee %t.out | FileCheck -strict-whitespace %s --check-prefix=OUT
-# RUN: grep -F "\"method\": \"textDocument/publishDiagnostics\"" %t.out | count 1
+# RUN: grep -F "\"method\": \"textDocument/publishDiagnostics\"" %t.out | count 2
+# RUN: grep -F "\"code\": \"module_not_found\"" %t.out | count 2
 
 #--- Use.cpp
 import NonExistent;
@@ -56,22 +58,45 @@ import NonExistent;
 ---
 {"jsonrpc":"2.0","id":1,"method":"sync","params":{}}
 ---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didChange",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "version": 2
+    },
+    "contentChanges": [
+      {
+        "text": "import NonExistent;"
+      }
+    ]
+  }
+}
+---
 {"jsonrpc":"2.0","id":2,"method":"sync","params":{}}
 ---
-{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+{"jsonrpc":"2.0","id":3,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":4,"method":"shutdown"}
 ---
 {"jsonrpc":"2.0","method":"exit"}
 
 # OUT: "method": "textDocument/publishDiagnostics"
-# OUT: "code": "module_not_found"
 # OUT: "message": "Module 'NonExistent' not found"
 # OUT: "version": 1
 # OUT: "id": 1,
 # OUT-NEXT:  "jsonrpc": "2.0",
 # OUT-NEXT:  "result": null
+# OUT: "method": "textDocument/publishDiagnostics"
+# OUT: "message": "Module 'NonExistent' not found"
+# OUT: "version": 2
 # OUT: "id": 2,
 # OUT-NEXT:  "jsonrpc": "2.0",
 # OUT-NEXT:  "result": null
 # OUT: "id": 3,
+# OUT-NEXT:  "jsonrpc": "2.0",
+# OUT-NEXT:  "result": null
+# OUT: "id": 4,
 # OUT-NEXT:  "jsonrpc": "2.0",
 # OUT-NEXT:  "result": null
