@@ -474,7 +474,8 @@ ModuleFileCache::getModule(StringRef ModuleName, PathRef ModuleUnitSourcePath) {
   return nullptr;
 }
 
-void ModuleFileCache::remove(StringRef ModuleName, PathRef ModuleUnitSourcePath) {
+void ModuleFileCache::remove(StringRef ModuleName,
+                             PathRef ModuleUnitSourcePath) {
   std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
   auto It = ModuleFiles.find(ModuleName);
@@ -586,8 +587,7 @@ llvm::SmallVector<std::string> getAllRequiredModules(PathRef RequiredSource,
 
     std::string SourceForModule =
         MDB.getSourceForModuleName(ModuleName, RequiredSource);
-    for (StringRef RequiredModuleName :
-         MDB.getRequiredModules(SourceForModule))
+    for (StringRef RequiredModuleName : MDB.getRequiredModules(SourceForModule))
       if (ModuleNamesSet.insert(RequiredModuleName).second)
         Visitor(RequiredModuleName, Visitor);
 
@@ -693,9 +693,8 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     std::string ReqFileName =
         MDB.getSourceForModuleName(ReqModuleName, RequiredSource);
     if (ReqFileName.empty())
-      return llvm::createStringError(
-          llvm::formatv("Don't get the module unit for module {0}",
-                        ReqModuleName));
+      return llvm::createStringError(llvm::formatv(
+          "Don't get the module unit for module {0}", ReqModuleName));
 
     if (auto Cached = Cache.getModule(ReqModuleName, ReqFileName)) {
       if (IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
