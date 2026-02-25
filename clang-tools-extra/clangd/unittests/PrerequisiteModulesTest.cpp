@@ -741,6 +741,50 @@ void func() {
               testing::HasSubstr("Print A value."));
 }
 
+TEST_F(PrerequisiteModulesTests, ModuleInternalMacroNotCompletedInImporter) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+#define A_INTERNAL_MACRO 1
+export void A_INTERNAL_FN();
+  )cpp");
+
+  llvm::StringLiteral UserContents = R"cpp(
+import A;
+void func() {
+  A_INT^
+}
+)cpp";
+
+  CDB.addFile("Use.cpp", UserContents);
+  Annotations Test(UserContents);
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  EXPECT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  EXPECT_TRUE(Preamble);
+  EXPECT_TRUE(Preamble->RequiredModules);
+
+  auto Result = codeComplete(getFullPath("Use.cpp"), Test.point(),
+                             Preamble.get(), Use, {});
+  EXPECT_THAT(Result.Completions,
+              testing::Contains(testing::Field(&CodeCompletion::Name,
+                                               "A_INTERNAL_FN")));
+  EXPECT_THAT(Result.Completions,
+              testing::Not(testing::Contains(testing::Field(
+                  &CodeCompletion::Name, "A_INTERNAL_MACRO"))));
+}
+
 TEST_F(PrerequisiteModulesTests, SignatureHelpTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
