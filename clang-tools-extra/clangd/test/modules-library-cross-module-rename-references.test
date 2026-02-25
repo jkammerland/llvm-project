@@ -1,0 +1,124 @@
+# Check cross-module library symbol workflows from importer-only context:
+# references + rename for symbols coming from A via B.
+#
+# Windows have different escaping modes.
+# FIXME: We should add one for windows.
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -fr %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test < %t/definition.jsonrpc \
+# RUN:      | FileCheck -strict-whitespace %t/definition.jsonrpc
+
+#--- A.cppm
+export module A;
+export void printA() {}
+
+#--- B.cppm
+export module B;
+export import A;
+export void printB() { printA(); }
+
+#--- Use.cpp
+import B;
+void foo() {
+    printA();
+    printB();
+}
+
+#--- compile_commands.json.tmpl
+[
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/Use.cpp.o -c DIR/Use.cpp",
+      "file": "DIR/Use.cpp"
+    },
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 DIR/B.cppm --precompile -o DIR/B.pcm",
+      "file": "DIR/B.cppm"
+    },
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
+      "file": "DIR/A.cppm"
+    }
+]
+
+#--- definition.jsonrpc.tmpl
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "initialize",
+  "params": {
+    "processId": 123,
+    "rootPath": "clangd",
+    "capabilities": {
+      "textDocument": {
+        "rename": {
+          "dynamicRegistration": true,
+          "prepareSupport": true
+        }
+      }
+    },
+    "trace": "off"
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "import B;\nvoid foo() {\n    printA();\n    printB();\n}\n"
+    }
+  }
+}
+---
+{"jsonrpc":"2.0","id":1,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{
+  "textDocument":{"uri":"file://DIR/Use.cpp"},
+  "position":{"line":2,"character":4},
+  "context":{"includeDeclaration":true}
+}}
+# CHECK: "id": 2,
+# CHECK: "result": [
+# CHECK: "uri": "file://{{.*}}/Use.cpp"
+---
+{"jsonrpc":"2.0","id":3,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{
+  "textDocument":{"uri":"file://DIR/Use.cpp"},
+  "position":{"line":2,"character":4},
+  "newName":"printARenamed"
+}}
+# CHECK: "id": 4,
+# CHECK: "result": {
+# CHECK: "changes": {
+# CHECK: "file://{{.*}}/Use.cpp": [
+# CHECK: "newText": "printARenamed"
+---
+{"jsonrpc":"2.0","id":5,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":6,"method":"textDocument/references","params":{
+  "textDocument":{"uri":"file://DIR/Use.cpp"},
+  "position":{"line":3,"character":4},
+  "context":{"includeDeclaration":true}
+}}
+# CHECK: "id": 6,
+# CHECK: "result": [
+# CHECK: "uri": "file://{{.*}}/Use.cpp"
+---
+{"jsonrpc":"2.0","id":7,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}
