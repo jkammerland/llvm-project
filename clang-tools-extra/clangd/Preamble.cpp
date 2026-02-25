@@ -636,6 +636,22 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   auto StatCacheFS = StatCache->getProducingFS(VFS);
   llvm::IntrusiveRefCntPtr<TimerFS> TimedFS(new TimerFS(StatCacheFS));
 
+  std::unique_ptr<PrerequisiteModules> RequiredModules;
+  if (Inputs.ModulesManager) {
+    WallTimer PrerequisiteModuleTimer;
+    PrerequisiteModuleTimer.startTimer();
+    RequiredModules =
+        Inputs.ModulesManager->buildPrerequisiteModulesFor(FileName,
+                                                           *Inputs.TFS);
+    PrerequisiteModuleTimer.stopTimer();
+
+    if (RequiredModules)
+      RequiredModules->adjustHeaderSearchOptions(CI.getHeaderSearchOpts());
+
+    log("Built prerequisite modules for file {0} in {1} seconds", FileName,
+        PrerequisiteModuleTimer.getTime());
+  }
+
   WallTimer PreambleTimer;
   PreambleTimer.startTimer();
   auto BuiltPreamble = PrecompiledPreamble::Build(
@@ -675,17 +691,7 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
     Result->Pragmas = std::make_shared<const include_cleaner::PragmaIncludes>(
         CapturedInfo.takePragmaIncludes());
 
-    if (Inputs.ModulesManager) {
-      WallTimer PrerequisiteModuleTimer;
-      PrerequisiteModuleTimer.startTimer();
-      Result->RequiredModules =
-          Inputs.ModulesManager->buildPrerequisiteModulesFor(FileName,
-                                                             *Inputs.TFS);
-      PrerequisiteModuleTimer.stopTimer();
-
-      log("Built prerequisite modules for file {0} in {1} seconds", FileName,
-          PrerequisiteModuleTimer.getTime());
-    }
+    Result->RequiredModules = std::move(RequiredModules);
 
     Result->Macros = CapturedInfo.takeMacros();
     Result->Marks = CapturedInfo.takeMarks();
