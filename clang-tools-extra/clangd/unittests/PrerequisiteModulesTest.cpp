@@ -464,6 +464,8 @@ int use() {
   return MValue;
 }
   )cpp");
+  UseInput = getInputs("Use.cpp", CDB);
+  Invocation = buildCompilerInvocation(UseInput, DiagConsumer);
   EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
 
   UseInfo = Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
