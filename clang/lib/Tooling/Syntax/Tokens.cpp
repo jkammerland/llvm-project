@@ -898,7 +898,7 @@ TokenBuffer TokenCollector::consume() && {
     clang::Token T;
     do {
       PP.Lex(T);
-    } while (T.kind() != tok::eof);
+    } while (T.getKind() != tok::eof);
   }
   PP.setTokenWatcher(nullptr);
   Collector->disable();
