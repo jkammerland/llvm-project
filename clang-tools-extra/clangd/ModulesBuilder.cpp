@@ -15,7 +15,9 @@
 #include "clang/Serialization/ModuleCache.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <optional>
 #include <queue>
 
 namespace clang {
@@ -82,6 +84,32 @@ std::string getModuleFilePath(llvm::StringRef ModuleName,
 
   ModuleFilePath.append(".pcm");
   return std::string(ModuleFilePath);
+}
+
+std::string getModuleContextHashFilePath(PathRef ModuleFilePath) {
+  return (ModuleFilePath + ".ctxhash").str();
+}
+
+void writeModuleContextHashFile(PathRef ModuleFilePath,
+                                llvm::StringRef ContextHash) {
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(getModuleContextHashFilePath(ModuleFilePath), EC);
+  if (EC) {
+    vlog("Failed to write module context hash file for {0}: {1}",
+         ModuleFilePath, EC.message());
+    return;
+  }
+  OS << ContextHash;
+}
+
+std::optional<std::string> readModuleContextHashFile(
+    PathRef ModuleFilePath,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  auto Buffer =
+      VFS->getBufferForFile(getModuleContextHashFilePath(ModuleFilePath));
+  if (!Buffer)
+    return std::nullopt;
+  return llvm::StringRef(Buffer.get()->getBuffer()).trim().str();
 }
 
 // FailedPrerequisiteModules - stands for the PrerequisiteModules which has
@@ -177,8 +205,10 @@ public:
   }
 
   virtual ~BuiltModuleFile() {
-    if (!ModuleFilePath.empty() && !DebugModulesBuilder)
+    if (!ModuleFilePath.empty() && !DebugModulesBuilder) {
       llvm::sys::fs::remove(ModuleFilePath);
+      llvm::sys::fs::remove(getModuleContextHashFilePath(ModuleFilePath));
+    }
   }
 };
 
@@ -268,6 +298,11 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
                           const CompilerInvocation *CI = nullptr) {
+  if (CI)
+    if (auto StoredContextHash = readModuleContextHashFile(ModuleFilePath, VFS);
+        StoredContextHash && *StoredContextHash != CI->computeContextHash())
+      return false;
+
   HeaderSearchOptions HSOpts;
   LangOptions LangOpts;
   PreprocessorOptions PPOpts;
@@ -380,6 +415,7 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
   CI->getHeaderSearchOpts().ValidateASTInputFilesContent = true;
 
   BuiltModuleFiles.adjustHeaderSearchOptions(CI->getHeaderSearchOpts());
+  const std::string ModuleContextHash = CI->computeContextHash();
 
   CI->getFrontendOpts().OutputFile = Inputs.CompileCommand.Output;
   auto Clang =
@@ -415,6 +451,8 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
                       "debugging. Remember to remove them after debugging.",
                       ModuleUnitFileName));
   }
+
+  writeModuleContextHashFile(Inputs.CompileCommand.Output, ModuleContextHash);
 
   return BuiltModuleFile::make(ModuleName, Inputs.CompileCommand.Output);
 }
