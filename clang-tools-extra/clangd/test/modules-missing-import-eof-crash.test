@@ -1,0 +1,77 @@
+# Regression test for #181358.
+#
+# Missing module import at EOF used to crash clangd when parsing stopped early.
+#
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -fr %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test -sync=0 < %t/definition.jsonrpc \
+# RUN:      2> %t.err | FileCheck %s --check-prefix=OUT
+# RUN: FileCheck %s --check-prefix=ERR < %t.err
+
+#--- A.cppm
+export module A;
+export int Answer = 42;
+
+#--- Use.cpp
+module;
+export module Use;
+import A;
+import NonExistent;
+
+#--- compile_commands.json.tmpl
+[
+  {
+    "directory": "DIR",
+    "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/Use.cpp.o -fmodule-file=A=DIR/A.pcm -c DIR/Use.cpp",
+    "file": "DIR/Use.cpp"
+  },
+  {
+    "directory": "DIR",
+    "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
+    "file": "DIR/A.cppm"
+  }
+]
+
+#--- definition.jsonrpc.tmpl
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "initialize",
+  "params": {
+    "processId": 123,
+    "rootPath": "clangd",
+    "capabilities": {},
+    "trace": "off"
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "module;\nexport module Use;\nimport A;\nimport NonExistent;\n"
+    }
+  }
+}
+---
+{"jsonrpc":"2.0","id":1,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}
+
+# OUT: "method": "textDocument/publishDiagnostics"
+# OUT: "message": "{{.*}}NonExistent{{.*}}"
+# ERR: Failed to build module NonExistent
