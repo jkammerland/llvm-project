@@ -144,6 +144,10 @@ public:
   /// Reading the comments from the PCH can be a performance hit even if the
   /// clients don't use them.
   bool WriteCommentListToPCH = true;
+  /// Whether to write comment locations into named-module BMIs.
+  /// This is disabled by default to keep BMI size smaller, but language
+  /// services may opt in when they need comment-aware tooling.
+  bool WriteCommentListToNamedModules = false;
 
   /// When enabled, preprocessor is in a mode for parsing a single file only.
   ///
