@@ -38,16 +38,19 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/PrettyPrinter.h"
+#include "clang/AST/RawCommentList.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/LangOptions.h"
+#include "clang/Basic/Module.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Index/IndexSymbol.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Tooling/Syntax/Tokens.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
@@ -1228,6 +1231,79 @@ std::string getSymbolName(include_cleaner::Symbol Sym) {
   return Name;
 }
 
+bool looksLikeDocComment(llvm::StringRef CommentText) {
+  return CommentText.find_first_not_of("/*-= \t\r\n") !=
+         llvm::StringRef::npos;
+}
+
+std::string getModuleImportDocumentation(const ImportDecl &ID,
+                                         ASTContext &ASTCtx) {
+  const Module *Imported = ID.getImportedModule();
+  if (!Imported || !Imported->DefinitionLoc.isValid())
+    return "";
+  auto &SM = ASTCtx.getSourceManager();
+  auto DefLoc = SM.getSpellingLoc(Imported->DefinitionLoc);
+  if (!DefLoc.isValid())
+    return "";
+
+  auto PrevTok = Lexer::findPreviousToken(DefLoc, SM, ASTCtx.getLangOpts(),
+                                          /*IncludeComments=*/true);
+  if (!PrevTok)
+    return "";
+  if (PrevTok->is(tok::kw_export)) {
+    PrevTok = Lexer::findPreviousToken(PrevTok->getLocation(), SM,
+                                       ASTCtx.getLangOpts(),
+                                       /*IncludeComments=*/true);
+    if (!PrevTok)
+      return "";
+  }
+  if (!PrevTok->is(tok::comment))
+    return "";
+
+  RawComment RC(SM, SourceRange(PrevTok->getLocation(), PrevTok->getEndLoc()),
+                ASTCtx.getLangOpts().CommentOpts, /*Merged=*/false);
+  if (!RC.isDocumentation())
+    return "";
+  std::string Doc = RC.getFormattedText(SM, ASTCtx.getDiagnostics());
+  if (!looksLikeDocComment(Doc))
+    return "";
+  return Doc;
+}
+
+const ImportDecl *locateModuleImport(const syntax::Token &Tok, ParsedAST &AST) {
+  if (Tok.kind() != tok::identifier)
+    return nullptr;
+  auto &SM = AST.getSourceManager();
+  const auto SpellingLoc = SM.getSpellingLoc(Tok.location());
+  for (const auto *D : AST.getLocalTopLevelDecls()) {
+    const auto *ID = llvm::dyn_cast<ImportDecl>(D);
+    if (!ID)
+      continue;
+    for (auto IdentifierLoc : ID->getIdentifierLocs()) {
+      if (SM.getSpellingLoc(IdentifierLoc) == SpellingLoc)
+        return ID;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<HoverInfo> getHoverContents(const ImportDecl &ID,
+                                          ASTContext &ASTCtx) {
+  const Module *Imported = ID.getImportedModule();
+  if (!Imported)
+    return std::nullopt;
+  std::string Documentation = getModuleImportDocumentation(ID, ASTCtx);
+  if (Documentation.empty())
+    return std::nullopt;
+
+  HoverInfo HI;
+  HI.Name = Imported->getFullModuleName();
+  HI.Kind = index::SymbolKind::Module;
+  HI.Documentation = std::move(Documentation);
+  HI.Definition = "module " + Imported->getFullModuleName().str();
+  return HI;
+}
+
 void maybeAddUsedSymbols(ParsedAST &AST, HoverInfo &HI, const Inclusion &Inc) {
   auto Converted = convertIncludes(AST);
   llvm::DenseSet<include_cleaner::Symbol> UsedSymbols;
@@ -1310,6 +1386,13 @@ std::optional<HoverInfo> getHover(ParsedAST &AST, Position Pos,
                                   include_cleaner::Symbol{IncludeCleanerMacro});
         }
         break;
+      }
+      if (const auto *ID = locateModuleImport(Tok, AST)) {
+        if (auto ImportHI = getHoverContents(*ID, AST.getASTContext())) {
+          HoverCountMetric.record(1, "module-import");
+          HI = std::move(*ImportHI);
+          break;
+        }
       }
     } else if (Tok.kind() == tok::kw_auto || Tok.kind() == tok::kw_decltype) {
       HoverCountMetric.record(1, "keyword");
