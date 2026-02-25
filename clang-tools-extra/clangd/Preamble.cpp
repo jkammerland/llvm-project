@@ -577,6 +577,11 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
   auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *ContentsBuffer, 0);
+  // Imports inside headers included by the preamble aren't reliably reflected
+  // in the patched main AST under experimental modules support. Keep the
+  // preamble empty in that mode so such imports are parsed in the main AST.
+  if (Inputs.ModulesManager && Bounds.Size != 0)
+    Bounds = {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
 
   trace::Span Tracer("BuildPreamble");
   SPAN_ATTACH(Tracer, "File", FileName);
