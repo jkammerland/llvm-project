@@ -450,11 +450,8 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
 
   // Adjust header search options to load the built module files recorded
   // in RequiredModules.
-  if (Preamble && Preamble->RequiredModules) {
-    Preamble->RequiredModules->adjustHeaderSearchOptions(
-        CI->getHeaderSearchOpts());
-    CI->getLangOpts().SkipODRCheckInGMF = true;
-  }
+  if (Preamble)
+    applyRequiredModulesSettings(Preamble->RequiredModules.get(), *CI);
 
   std::optional<PreamblePatch> Patch;
   // We might use an ignoring diagnostic consumer if they are going to be

@@ -571,6 +571,85 @@ import A;
   EXPECT_TRUE(D.isFromASTFile());
 }
 
+// Regression test for #100924.
+TEST_F(PrerequisiteModulesTests, NoFalseODRViolationInMultipleGMFs) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  {
+    SmallString<256> SharedHeader(TestDir);
+    llvm::sys::path::append(SharedHeader, "shared.h");
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(SharedHeader, EC);
+    ASSERT_FALSE(EC);
+    OS << R"cpp(
+template <class T>
+concept HasFoo = requires {
+  T::foo;
+};
+
+template <class T>
+struct Category {
+  static constexpr int message = T::foo;
+};
+  )cpp";
+  }
+
+  CDB.addFile("b.cppm", R"cpp(
+module;
+#include "shared.h"
+export module b;
+
+export template <class T>
+concept C = requires() {
+  Category<T>::message;
+};
+  )cpp");
+
+  CDB.addFile("c.cppm", R"cpp(
+module;
+#include "shared.h"
+
+export module c;
+import b;
+
+class B {
+public:
+  static constexpr int foo = 1;
+};
+
+export template <class T>
+  requires C<T>
+class D {};
+
+D<B> S;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("c.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  EXPECT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("c.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  EXPECT_TRUE(Preamble);
+  EXPECT_TRUE(Preamble->RequiredModules);
+  HeaderSearchOptions HSOpts;
+  Preamble->RequiredModules->adjustHeaderSearchOptions(HSOpts);
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("b"));
+
+  auto AST = ParsedAST::build(getFullPath("c.cppm"), Input, std::move(CI), {},
+                              Preamble);
+  EXPECT_TRUE(AST);
+
+  for (const auto &Diag : AST->getDiagnostics())
+    EXPECT_NE(Diag.Name, "module_odr_violation_missing_decl");
+}
+
 // An end to end test for code complete in modules
 TEST_F(PrerequisiteModulesTests, CodeCompleteTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
