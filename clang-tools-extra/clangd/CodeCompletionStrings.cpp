@@ -123,10 +123,6 @@ std::string getDeclComment(const ASTContext &Ctx, const NamedDecl &Decl) {
     if (!RC)
       return "";
 
-    // Sanity check that the comment does not come from the PCH. We choose to
-    // not write them into PCH, because they are racy and slow to load.
-    assert(!Ctx.getSourceManager().isLoadedSourceLocation(RC->getBeginLoc()));
-
     comments::FullComment *FC = RC->parse(Ctx, /*PP=*/nullptr, ND);
     if (!FC)
       return "";
@@ -146,9 +142,6 @@ std::string getDeclComment(const ASTContext &Ctx, const NamedDecl &Decl) {
     RC = getCompletionComment(Ctx, &Decl);
     if (!RC)
       return "";
-    // Sanity check that the comment does not come from the PCH. We choose to
-    // not write them into PCH, because they are racy and slow to load.
-    assert(!Ctx.getSourceManager().isLoadedSourceLocation(RC->getBeginLoc()));
     Doc = RC->getFormattedText(Ctx.getSourceManager(), Ctx.getDiagnostics());
     if (!looksLikeDocComment(Doc))
       return "";

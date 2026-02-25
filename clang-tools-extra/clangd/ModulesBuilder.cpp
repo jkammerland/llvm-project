@@ -13,9 +13,12 @@
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ModuleCache.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <optional>
 #include <queue>
 
 namespace clang {
@@ -84,6 +87,50 @@ std::string getModuleFilePath(llvm::StringRef ModuleName,
   return std::string(ModuleFilePath);
 }
 
+std::string getModuleContextHashFilePath(PathRef ModuleFilePath) {
+  return (ModuleFilePath + ".ctxhash").str();
+}
+
+void writeModuleContextHashFile(PathRef ModuleFilePath,
+                                llvm::StringRef ContextHash) {
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(getModuleContextHashFilePath(ModuleFilePath), EC);
+  if (EC) {
+    vlog("Failed to write module context hash file for {0}: {1}",
+         ModuleFilePath, EC.message());
+    return;
+  }
+  OS << ContextHash;
+}
+
+std::optional<std::string>
+readModuleContextHashFile(PathRef ModuleFilePath,
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  auto Buffer =
+      VFS->getBufferForFile(getModuleContextHashFilePath(ModuleFilePath));
+  if (!Buffer)
+    return std::nullopt;
+  return llvm::StringRef(Buffer.get()->getBuffer()).trim().str();
+}
+
+std::string getResolvedModuleSourceIdentity(
+    PathRef ModuleUnitFileName,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  llvm::SmallString<256> ResolvedPath;
+  if (!VFS || VFS->getRealPath(ModuleUnitFileName, ResolvedPath))
+    return ModuleUnitFileName.str();
+  return ResolvedPath.str().str();
+}
+
+std::string
+getCompileCommandFingerprint(const tooling::CompileCommand &CompileCommand) {
+  llvm::hash_code Hash = llvm::hash_combine(
+      CompileCommand.Directory, CompileCommand.Filename, CompileCommand.Output);
+  for (const auto &Arg : CompileCommand.CommandLine)
+    Hash = llvm::hash_combine(Hash, Arg);
+  return std::to_string(static_cast<uint64_t>(Hash));
+}
+
 // FailedPrerequisiteModules - stands for the PrerequisiteModules which has
 // errors happened during the building process.
 class FailedPrerequisiteModules : public PrerequisiteModules {
@@ -92,8 +139,7 @@ public:
 
   // We shouldn't adjust the compilation commands based on
   // FailedPrerequisiteModules.
-  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {
-  }
+  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {}
 
   // FailedPrerequisiteModules can never be reused.
   bool
@@ -106,8 +152,12 @@ public:
 /// Represents a reference to a module file (*.pcm).
 class ModuleFile {
 protected:
-  ModuleFile(StringRef ModuleName, PathRef ModuleFilePath)
-      : ModuleName(ModuleName.str()), ModuleFilePath(ModuleFilePath.str()) {}
+  ModuleFile(StringRef ModuleName, PathRef ModuleFilePath,
+             StringRef ModuleSourceIdentity,
+             StringRef CompileCommandFingerprint)
+      : ModuleName(ModuleName.str()), ModuleFilePath(ModuleFilePath.str()),
+        ModuleSourceIdentity(ModuleSourceIdentity.str()),
+        CompileCommandFingerprint(CompileCommandFingerprint.str()) {}
 
 public:
   ModuleFile() = delete;
@@ -118,9 +168,13 @@ public:
   // The move constructor is needed for llvm::SmallVector.
   ModuleFile(ModuleFile &&Other)
       : ModuleName(std::move(Other.ModuleName)),
-        ModuleFilePath(std::move(Other.ModuleFilePath)) {
+        ModuleFilePath(std::move(Other.ModuleFilePath)),
+        ModuleSourceIdentity(std::move(Other.ModuleSourceIdentity)),
+        CompileCommandFingerprint(std::move(Other.CompileCommandFingerprint)) {
     Other.ModuleName.clear();
     Other.ModuleFilePath.clear();
+    Other.ModuleSourceIdentity.clear();
+    Other.CompileCommandFingerprint.clear();
   }
 
   ModuleFile &operator=(ModuleFile &&Other) {
@@ -136,10 +190,16 @@ public:
   StringRef getModuleName() const { return ModuleName; }
 
   StringRef getModuleFilePath() const { return ModuleFilePath; }
+  StringRef getModuleSourceIdentity() const { return ModuleSourceIdentity; }
+  StringRef getCompileCommandFingerprint() const {
+    return CompileCommandFingerprint;
+  }
 
 protected:
   std::string ModuleName;
   std::string ModuleFilePath;
+  std::string ModuleSourceIdentity;
+  std::string CompileCommandFingerprint;
 };
 
 /// Represents a prebuilt module file which is not owned by us.
@@ -150,13 +210,18 @@ private:
   struct CtorTag {};
 
 public:
-  PrebuiltModuleFile(StringRef ModuleName, PathRef ModuleFilePath, CtorTag)
-      : ModuleFile(ModuleName, ModuleFilePath) {}
+  PrebuiltModuleFile(StringRef ModuleName, PathRef ModuleFilePath,
+                     StringRef ModuleSourceIdentity,
+                     StringRef CompileCommandFingerprint, CtorTag)
+      : ModuleFile(ModuleName, ModuleFilePath, ModuleSourceIdentity,
+                   CompileCommandFingerprint) {}
 
-  static std::shared_ptr<PrebuiltModuleFile> make(StringRef ModuleName,
-                                                  PathRef ModuleFilePath) {
+  static std::shared_ptr<PrebuiltModuleFile>
+  make(StringRef ModuleName, PathRef ModuleFilePath,
+       StringRef ModuleSourceIdentity, StringRef CompileCommandHash) {
     return std::make_shared<PrebuiltModuleFile>(ModuleName, ModuleFilePath,
-                                                CtorTag{});
+                                                ModuleSourceIdentity,
+                                                CompileCommandHash, CtorTag{});
   }
 };
 
@@ -168,18 +233,26 @@ private:
   struct CtorTag {};
 
 public:
-  BuiltModuleFile(StringRef ModuleName, PathRef ModuleFilePath, CtorTag)
-      : ModuleFile(ModuleName, ModuleFilePath) {}
+  BuiltModuleFile(StringRef ModuleName, PathRef ModuleFilePath,
+                  StringRef ModuleSourceIdentity,
+                  StringRef CompileCommandFingerprint, CtorTag)
+      : ModuleFile(ModuleName, ModuleFilePath, ModuleSourceIdentity,
+                   CompileCommandFingerprint) {}
 
   static std::shared_ptr<BuiltModuleFile> make(StringRef ModuleName,
-                                               PathRef ModuleFilePath) {
+                                               PathRef ModuleFilePath,
+                                               StringRef ModuleSourceIdentity,
+                                               StringRef CompileCommandHash) {
     return std::make_shared<BuiltModuleFile>(ModuleName, ModuleFilePath,
-                                             CtorTag{});
+                                             ModuleSourceIdentity,
+                                             CompileCommandHash, CtorTag{});
   }
 
   virtual ~BuiltModuleFile() {
-    if (!ModuleFilePath.empty() && !DebugModulesBuilder)
+    if (!ModuleFilePath.empty() && !DebugModulesBuilder) {
       llvm::sys::fs::remove(ModuleFilePath);
+      llvm::sys::fs::remove(getModuleContextHashFilePath(ModuleFilePath));
+    }
   }
 };
 
@@ -188,7 +261,13 @@ public:
 // are owned by the modules builder.
 class ReusablePrerequisiteModules : public PrerequisiteModules {
 public:
-  ReusablePrerequisiteModules() = default;
+  ReusablePrerequisiteModules(
+      PathRef MainFile, const GlobalCompilationDatabase &CDB,
+      llvm::ArrayRef<std::string> DirectRequiredModuleNames)
+      : MainFile(MainFile.str()), CDB(&CDB) {
+    for (llvm::StringRef ModuleName : DirectRequiredModuleNames)
+      this->DirectRequiredModuleNames.insert(ModuleName);
+  }
 
   ReusablePrerequisiteModules(const ReusablePrerequisiteModules &Other) =
       default;
@@ -231,15 +310,51 @@ public:
   }
 
 private:
+  bool hasSameRequiredModules() const {
+    auto ProjectModules = CDB->getProjectModules(MainFile);
+    if (!ProjectModules)
+      return false;
+
+    llvm::StringSet<> CurrentRequiredModuleNames;
+    for (llvm::StringRef ModuleName :
+         ProjectModules->getRequiredModules(MainFile))
+      CurrentRequiredModuleNames.insert(ModuleName);
+
+    if (CurrentRequiredModuleNames.size() != DirectRequiredModuleNames.size())
+      return false;
+
+    for (llvm::StringRef ModuleName : DirectRequiredModuleNames.keys()) {
+      if (!CurrentRequiredModuleNames.contains(ModuleName))
+        return false;
+    }
+    return true;
+  }
+
   llvm::SmallVector<std::shared_ptr<const ModuleFile>, 8> RequiredModules;
+  std::string MainFile;
+  const GlobalCompilationDatabase *CDB = nullptr;
+  llvm::StringSet<> DirectRequiredModuleNames;
   // A helper class to speedup the query if a module is built.
   llvm::StringSet<> BuiltModuleNames;
 };
 
 bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
-                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                          const CompilerInvocation *CI = nullptr) {
+  if (CI)
+    if (auto StoredContextHash = readModuleContextHashFile(ModuleFilePath, VFS);
+        StoredContextHash && *StoredContextHash != CI->computeContextHash())
+      return false;
+
   HeaderSearchOptions HSOpts;
+  LangOptions LangOpts;
+  PreprocessorOptions PPOpts;
+  if (CI) {
+    HSOpts = CI->getHeaderSearchOpts();
+    LangOpts = CI->getLangOpts();
+    PPOpts = CI->getPreprocessorOpts();
+  }
   RequisiteModules.adjustHeaderSearchOptions(HSOpts);
   HSOpts.ForceCheckCXX20ModulesInputFiles = true;
   HSOpts.ValidateASTInputFilesContent = true;
@@ -250,17 +365,14 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
       CompilerInstance::createDiagnostics(*VFS, DiagOpts, &IgnoreDiags,
                                           /*ShouldOwnClient=*/false);
 
-  LangOptions LangOpts;
+  // In clang's driver, we suppress ODR checks in GMF while building modules.
+  // Keep validation aligned with that mode to avoid mismatched acceptance.
   LangOpts.SkipODRCheckInGMF = true;
 
   FileManager FileMgr(FileSystemOptions(), VFS);
-
   SourceManager SourceMgr(*Diags, FileMgr);
-
   HeaderSearch HeaderInfo(HSOpts, SourceMgr, *Diags, LangOpts,
                           /*Target=*/nullptr);
-
-  PreprocessorOptions PPOpts;
   TrivialModuleLoader ModuleLoader;
   Preprocessor PP(PPOpts, *Diags, LangOpts, SourceMgr, HeaderInfo,
                   ModuleLoader);
@@ -275,9 +387,12 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
   // listener.
   Reader.setListener(nullptr);
 
+  const unsigned ValidationCaps =
+      ASTReader::ARR_OutOfDate | ASTReader::ARR_Missing |
+      ASTReader::ARR_ConfigurationMismatch |
+      ASTReader::ARR_TreatModuleWithErrorsAsOutOfDate;
   if (Reader.ReadAST(ModuleFilePath, serialization::MK_MainFile,
-                     SourceLocation(),
-                     ASTReader::ARR_None) != ASTReader::Success)
+                     SourceLocation(), ValidationCaps) != ASTReader::Success)
     return false;
 
   bool UpToDate = true;
@@ -293,13 +408,13 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
   return UpToDate;
 }
 
-bool IsModuleFilesUpToDate(
-    llvm::SmallVector<PathRef> ModuleFilePaths,
-    const PrerequisiteModules &RequisiteModules,
-    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+bool IsModuleFilesUpToDate(llvm::SmallVector<PathRef> ModuleFilePaths,
+                           const PrerequisiteModules &RequisiteModules,
+                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                           const CompilerInvocation &CI) {
   return llvm::all_of(
-      ModuleFilePaths, [&RequisiteModules, VFS](auto ModuleFilePath) {
-        return IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS);
+      ModuleFilePaths, [&RequisiteModules, VFS, &CI](auto ModuleFilePath) {
+        return IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS, &CI);
       });
 }
 
@@ -307,6 +422,8 @@ bool IsModuleFilesUpToDate(
 /// module file are stored in \param BuiltModuleFiles.
 llvm::Expected<std::shared_ptr<BuiltModuleFile>>
 buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
+                StringRef ModuleSourceIdentity,
+                StringRef CompileCommandFingerprint,
                 const GlobalCompilationDatabase &CDB, const ThreadsafeFS &TFS,
                 const ReusablePrerequisiteModules &BuiltModuleFiles) {
   // Try cheap operation earlier to boil-out cheaply if there are problems.
@@ -342,8 +459,13 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
   // So that we can check if the files are still valid when we want to reuse the
   // BMI files.
   CI->getHeaderSearchOpts().ValidateASTInputFilesContent = true;
+  // Preserve doc comments in clangd-built BMIs so code-intelligence features
+  // (e.g. completion docs) can surface comments from imported modules.
+  CI->getPreprocessorOpts().WriteCommentListToPCH = true;
+  CI->getPreprocessorOpts().WriteCommentListToNamedModules = true;
 
   BuiltModuleFiles.adjustHeaderSearchOptions(CI->getHeaderSearchOpts());
+  const std::string ModuleContextHash = CI->computeContextHash();
 
   CI->getFrontendOpts().OutputFile = Inputs.CompileCommand.Output;
   auto Clang =
@@ -380,19 +502,25 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
                       ModuleUnitFileName));
   }
 
-  return BuiltModuleFile::make(ModuleName, Inputs.CompileCommand.Output);
+  writeModuleContextHashFile(Inputs.CompileCommand.Output, ModuleContextHash);
+
+  return BuiltModuleFile::make(ModuleName, Inputs.CompileCommand.Output,
+                               ModuleSourceIdentity, CompileCommandFingerprint);
 }
 
 bool ReusablePrerequisiteModules::canReuse(
     const CompilerInvocation &CI,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) const {
+  if (!hasSameRequiredModules())
+    return false;
+
   if (RequiredModules.empty())
     return true;
 
   llvm::SmallVector<llvm::StringRef> BMIPaths;
   for (auto &MF : RequiredModules)
     BMIPaths.push_back(MF->getModuleFilePath());
-  return IsModuleFilesUpToDate(BMIPaths, *this, VFS);
+  return IsModuleFilesUpToDate(BMIPaths, *this, VFS, CI);
 }
 
 class ModuleFileCache {
@@ -400,68 +528,101 @@ public:
   ModuleFileCache(const GlobalCompilationDatabase &CDB) : CDB(CDB) {}
   const GlobalCompilationDatabase &getCDB() const { return CDB; }
 
-  std::shared_ptr<const ModuleFile> getModule(StringRef ModuleName);
+  std::shared_ptr<const ModuleFile> getModule(StringRef ModuleName,
+                                              PathRef ModuleUnitSourcePath);
 
-  void add(StringRef ModuleName, std::shared_ptr<const ModuleFile> ModuleFile) {
+  void add(StringRef ModuleName, PathRef ModuleUnitSourcePath,
+           std::shared_ptr<const ModuleFile> ModuleFile) {
     std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
-    ModuleFiles[ModuleName] = ModuleFile;
+    ModuleFiles[ModuleName][maybeCaseFoldPath(ModuleUnitSourcePath)] =
+        ModuleFile;
   }
 
-  void remove(StringRef ModuleName);
+  void remove(StringRef ModuleName, PathRef ModuleUnitSourcePath);
 
 private:
   const GlobalCompilationDatabase &CDB;
 
-  llvm::StringMap<std::weak_ptr<const ModuleFile>> ModuleFiles;
+  llvm::StringMap<llvm::StringMap<std::weak_ptr<const ModuleFile>>> ModuleFiles;
   // Mutex to guard accesses to ModuleFiles.
   std::mutex ModuleFilesMutex;
 };
 
 std::shared_ptr<const ModuleFile>
-ModuleFileCache::getModule(StringRef ModuleName) {
+ModuleFileCache::getModule(StringRef ModuleName, PathRef ModuleUnitSourcePath) {
   std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
-  auto Iter = ModuleFiles.find(ModuleName);
-  if (Iter == ModuleFiles.end())
+  auto It = ModuleFiles.find(ModuleName);
+  if (It == ModuleFiles.end())
     return nullptr;
 
-  if (auto Res = Iter->second.lock())
+  auto SourcePathKey = maybeCaseFoldPath(ModuleUnitSourcePath);
+  auto SourceIt = It->second.find(SourcePathKey);
+  if (SourceIt == It->second.end())
+    return nullptr;
+
+  if (auto Res = SourceIt->second.lock())
     return Res;
 
-  ModuleFiles.erase(Iter);
+  It->second.erase(SourceIt);
+  if (It->second.empty())
+    ModuleFiles.erase(It);
   return nullptr;
 }
 
-void ModuleFileCache::remove(StringRef ModuleName) {
+void ModuleFileCache::remove(StringRef ModuleName,
+                             PathRef ModuleUnitSourcePath) {
   std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
-  ModuleFiles.erase(ModuleName);
+  auto It = ModuleFiles.find(ModuleName);
+  if (It == ModuleFiles.end())
+    return;
+
+  It->second.erase(maybeCaseFoldPath(ModuleUnitSourcePath));
+  if (It->second.empty())
+    ModuleFiles.erase(It);
 }
 
 class ModuleNameToSourceCache {
 public:
-  std::string getSourceForModuleName(llvm::StringRef ModuleName) {
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) {
     std::lock_guard<std::mutex> Lock(CacheMutex);
-    auto Iter = ModuleNameToSourceCache.find(ModuleName);
-    if (Iter != ModuleNameToSourceCache.end())
-      return Iter->second;
+
+    auto It = ModuleNameToSourceCache.find(ModuleName);
+    if (It == ModuleNameToSourceCache.end())
+      return "";
+
+    auto RequiredSrcKey = maybeCaseFoldPath(RequiredSrcFile);
+    auto RequiredSrcIt = It->second.find(RequiredSrcKey);
+    if (RequiredSrcIt != It->second.end())
+      return RequiredSrcIt->second;
+
     return "";
   }
 
-  void addEntry(llvm::StringRef ModuleName, PathRef Source) {
+  void addEntry(llvm::StringRef ModuleName, PathRef RequiredSrcFile,
+                PathRef Source) {
     std::lock_guard<std::mutex> Lock(CacheMutex);
-    ModuleNameToSourceCache[ModuleName] = Source.str();
+    ModuleNameToSourceCache[ModuleName][maybeCaseFoldPath(RequiredSrcFile)] =
+        Source.str();
   }
 
-  void eraseEntry(llvm::StringRef ModuleName) {
+  void eraseEntry(llvm::StringRef ModuleName, PathRef RequiredSrcFile) {
     std::lock_guard<std::mutex> Lock(CacheMutex);
-    ModuleNameToSourceCache.erase(ModuleName);
+    auto It = ModuleNameToSourceCache.find(ModuleName);
+    if (It == ModuleNameToSourceCache.end())
+      return;
+
+    It->second.erase(maybeCaseFoldPath(RequiredSrcFile));
+    if (It->second.empty())
+      ModuleNameToSourceCache.erase(It);
   }
 
 private:
   std::mutex CacheMutex;
-  llvm::StringMap<std::string> ModuleNameToSourceCache;
+  llvm::StringMap<llvm::StringMap<std::string>> ModuleNameToSourceCache;
 };
 
 class CachingProjectModules : public ProjectModules {
@@ -483,7 +644,8 @@ public:
 
   std::string getSourceForModuleName(llvm::StringRef ModuleName,
                                      PathRef RequiredSrcFile) override {
-    std::string CachedResult = Cache.getSourceForModuleName(ModuleName);
+    std::string CachedResult =
+        Cache.getSourceForModuleName(ModuleName, RequiredSrcFile);
 
     // Verify Cached Result by seeing if the source declaring the same module
     // as we query.
@@ -494,11 +656,11 @@ public:
         return CachedResult;
 
       // Cached Result is invalid. Clear it.
-      Cache.eraseEntry(ModuleName);
+      Cache.eraseEntry(ModuleName, RequiredSrcFile);
     }
 
     auto Result = MDB->getSourceForModuleName(ModuleName, RequiredSrcFile);
-    Cache.addEntry(ModuleName, Result);
+    Cache.addEntry(ModuleName, RequiredSrcFile, Result);
 
     return Result;
   }
@@ -520,8 +682,9 @@ llvm::SmallVector<std::string> getAllRequiredModules(PathRef RequiredSource,
   auto VisitDeps = [&](StringRef ModuleName, auto Visitor) -> void {
     ModuleNamesSet.insert(ModuleName);
 
-    for (StringRef RequiredModuleName : MDB.getRequiredModules(
-             MDB.getSourceForModuleName(ModuleName, RequiredSource)))
+    std::string SourceForModule =
+        MDB.getSourceForModuleName(ModuleName, RequiredSource);
+    for (StringRef RequiredModuleName : MDB.getRequiredModules(SourceForModule))
       if (ModuleNamesSet.insert(RequiredModuleName).second)
         Visitor(RequiredModuleName, Visitor);
 
@@ -585,11 +748,13 @@ void ModulesBuilder::ModulesBuilderImpl::getPrebuiltModuleFile(
       continue;
 
     if (IsModuleFileUpToDate(ModuleFilePath, BuiltModuleFiles,
-                             TFS.view(std::nullopt))) {
+                             TFS.view(std::nullopt), CI.get())) {
       log("Reusing prebuilt module file {0} of module {1} for {2}",
           ModuleFilePath, ModuleName, ModuleUnitFileName);
       BuiltModuleFiles.addModuleFile(
-          PrebuiltModuleFile::make(ModuleName, ModuleFilePath));
+          PrebuiltModuleFile::make(ModuleName, ModuleFilePath,
+                                   /*ModuleSourceIdentity=*/"",
+                                   /*CompileCommandHash=*/""));
     }
   }
 }
@@ -624,26 +789,45 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     if (BuiltModuleFiles.isModuleUnitBuilt(ReqModuleName))
       continue;
 
-    if (auto Cached = Cache.getModule(ReqModuleName)) {
-      if (IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
-                               TFS.view(std::nullopt))) {
+    std::string ReqFileName =
+        MDB.getSourceForModuleName(ReqModuleName, RequiredSource);
+    if (ReqFileName.empty())
+      return llvm::createStringError(llvm::formatv(
+          "Don't get the module unit for module {0}", ReqModuleName));
+    std::string ReqSourceIdentity =
+        getResolvedModuleSourceIdentity(ReqFileName, TFS.view(std::nullopt));
+    std::unique_ptr<CompilerInvocation> ReqCI;
+    std::string ReqCommandFingerprint;
+    if (auto ReqCmd = getCDB().getCompileCommand(ReqFileName)) {
+      ReqCommandFingerprint = getCompileCommandFingerprint(*ReqCmd);
+      ParseInputs Inputs;
+      Inputs.TFS = &TFS;
+      Inputs.CompileCommand = std::move(*ReqCmd);
+      IgnoreDiagnostics IgnoreDiags;
+      ReqCI = buildCompilerInvocation(Inputs, IgnoreDiags);
+    }
+
+    if (auto Cached = Cache.getModule(ReqModuleName, ReqFileName)) {
+      if (ReqCI && Cached->getModuleSourceIdentity() == ReqSourceIdentity &&
+          Cached->getCompileCommandFingerprint() == ReqCommandFingerprint &&
+          IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
+                               TFS.view(std::nullopt), ReqCI.get())) {
         log("Reusing module {0} from {1}", ReqModuleName,
             Cached->getModuleFilePath());
         BuiltModuleFiles.addModuleFile(std::move(Cached));
         continue;
       }
-      Cache.remove(ReqModuleName);
+      Cache.remove(ReqModuleName, ReqFileName);
     }
 
-    std::string ReqFileName =
-        MDB.getSourceForModuleName(ReqModuleName, RequiredSource);
-    llvm::Expected<std::shared_ptr<BuiltModuleFile>> MF = buildModuleFile(
-        ReqModuleName, ReqFileName, getCDB(), TFS, BuiltModuleFiles);
+    llvm::Expected<std::shared_ptr<BuiltModuleFile>> MF =
+        buildModuleFile(ReqModuleName, ReqFileName, ReqSourceIdentity,
+                        ReqCommandFingerprint, getCDB(), TFS, BuiltModuleFiles);
     if (llvm::Error Err = MF.takeError())
       return Err;
 
     log("Built module {0} to {1}", ReqModuleName, (*MF)->getModuleFilePath());
-    Cache.add(ReqModuleName, *MF);
+    Cache.add(ReqModuleName, ReqFileName, *MF);
     BuiltModuleFiles.addModuleFile(std::move(*MF));
   }
 
@@ -663,10 +847,10 @@ ModulesBuilder::buildPrerequisiteModulesFor(PathRef File,
 
   std::vector<std::string> RequiredModuleNames =
       CachedMDB.getRequiredModules(File);
+  auto RequiredModules = std::make_unique<ReusablePrerequisiteModules>(
+      File, Impl->getCDB(), RequiredModuleNames);
   if (RequiredModuleNames.empty())
-    return std::make_unique<ReusablePrerequisiteModules>();
-
-  auto RequiredModules = std::make_unique<ReusablePrerequisiteModules>();
+    return RequiredModules;
   for (llvm::StringRef RequiredModuleName : RequiredModuleNames) {
     // Return early if there is any error.
     if (llvm::Error Err = Impl->getOrBuildModuleFile(

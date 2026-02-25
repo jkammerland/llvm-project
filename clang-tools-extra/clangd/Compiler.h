@@ -76,6 +76,12 @@ std::unique_ptr<CompilerInvocation>
 buildCompilerInvocation(const ParseInputs &Inputs, clang::DiagnosticConsumer &D,
                         std::vector<std::string> *CC1Args = nullptr);
 
+/// Applies required modules settings onto \p CI.
+/// This wires prebuilt module files and mirrors clang driver's current behavior
+/// by suppressing known ODR false positives in global module fragments.
+void applyRequiredModulesSettings(const PrerequisiteModules *RequiredModules,
+                                  CompilerInvocation &CI);
+
 /// Creates a compiler instance, configured so that:
 ///   - Contents of the parsed file are remapped to \p MainFile.
 ///   - Preamble is overriden to use PCH passed to this function. It means the

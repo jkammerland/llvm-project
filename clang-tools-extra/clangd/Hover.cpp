@@ -38,16 +38,19 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/PrettyPrinter.h"
+#include "clang/AST/RawCommentList.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/LangOptions.h"
+#include "clang/Basic/Module.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/TokenKinds.h"
 #include "clang/Index/IndexSymbol.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Tooling/Syntax/Tokens.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
@@ -1228,6 +1231,116 @@ std::string getSymbolName(include_cleaner::Symbol Sym) {
   return Name;
 }
 
+bool looksLikeDocComment(llvm::StringRef CommentText) {
+  return CommentText.find_first_not_of("/*-= \t\r\n") !=
+         llvm::StringRef::npos;
+}
+
+std::string getModuleImportDocumentation(const ImportDecl &ID,
+                                         ASTContext &ASTCtx) {
+  const Module *Imported = ID.getImportedModule();
+  if (!Imported || !Imported->DefinitionLoc.isValid())
+    return "";
+  auto &SM = ASTCtx.getSourceManager();
+  auto DefLoc = SM.getSpellingLoc(Imported->DefinitionLoc);
+  if (!DefLoc.isValid())
+    return "";
+
+  auto PrevTok = Lexer::findPreviousToken(DefLoc, SM, ASTCtx.getLangOpts(),
+                                          /*IncludeComments=*/true);
+  while (PrevTok && (PrevTok->is(tok::kw_export) || PrevTok->is(tok::kw_module) ||
+                     PrevTok->is(tok::identifier) || PrevTok->is(tok::period) ||
+                     PrevTok->is(tok::colon))) {
+    PrevTok = Lexer::findPreviousToken(PrevTok->getLocation(), SM,
+                                       ASTCtx.getLangOpts(),
+                                       /*IncludeComments=*/true);
+  }
+  if (PrevTok && PrevTok->is(tok::comment)) {
+    RawComment RC(SM, SourceRange(PrevTok->getLocation(), PrevTok->getEndLoc()),
+                  ASTCtx.getLangOpts().CommentOpts, /*Merged=*/false);
+    if (RC.isDocumentation()) {
+      std::string Doc = RC.getFormattedText(SM, ASTCtx.getDiagnostics());
+      if (looksLikeDocComment(Doc))
+        return Doc;
+    }
+  }
+
+  const auto SourcePath = SM.getFilename(DefLoc);
+  if (SourcePath.empty())
+    return "";
+  auto BufferOrErr = SM.getFileManager().getBufferForFile(SourcePath);
+  if (!BufferOrErr)
+    return "";
+  StringRef Buffer = (*BufferOrErr)->getBuffer();
+
+  const std::string ModuleName = Imported->getFullModuleName();
+  SmallVector<StringRef, 8> Lines;
+  Buffer.split(Lines, '\n');
+  for (size_t I = 0; I < Lines.size(); ++I) {
+    StringRef DeclLine = Lines[I].ltrim(" \t");
+    if (!DeclLine.starts_with("module") && !DeclLine.starts_with("export"))
+      continue;
+    if (!DeclLine.contains("module") || !DeclLine.contains(ModuleName))
+      continue;
+    if (I == 0)
+      return "";
+
+    SmallVector<StringRef, 4> DocLines;
+    for (int Line = static_cast<int>(I) - 1; Line >= 0; --Line) {
+      StringRef Trimmed = Lines[Line].ltrim(" \t");
+      if (!Trimmed.starts_with("///") && !Trimmed.starts_with("//!"))
+        break;
+      Trimmed = Trimmed.drop_front(3).ltrim(" \t").rtrim(" \r");
+      DocLines.push_back(Trimmed);
+    }
+    if (DocLines.empty())
+      return "";
+
+    std::string Doc;
+    for (int J = static_cast<int>(DocLines.size()) - 1; J >= 0; --J) {
+      Doc.append(DocLines[J].begin(), DocLines[J].end());
+      if (J != 0)
+        Doc.push_back('\n');
+    }
+    return Doc;
+  }
+  return "";
+}
+
+const ImportDecl *locateModuleImport(const syntax::Token &Tok, ParsedAST &AST) {
+  if (Tok.kind() != tok::identifier)
+    return nullptr;
+  auto &SM = AST.getSourceManager();
+  const auto SpellingLoc = SM.getSpellingLoc(Tok.location());
+  for (const auto *D : AST.getLocalTopLevelDecls()) {
+    const auto *ID = llvm::dyn_cast<ImportDecl>(D);
+    if (!ID)
+      continue;
+    for (auto IdentifierLoc : ID->getIdentifierLocs()) {
+      if (SM.getSpellingLoc(IdentifierLoc) == SpellingLoc)
+        return ID;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<HoverInfo> getHoverContents(const ImportDecl &ID,
+                                          ASTContext &ASTCtx) {
+  const Module *Imported = ID.getImportedModule();
+  if (!Imported)
+    return std::nullopt;
+  std::string Documentation = getModuleImportDocumentation(ID, ASTCtx);
+  if (Documentation.empty())
+    return std::nullopt;
+
+  HoverInfo HI;
+  HI.Name = Imported->getFullModuleName();
+  HI.Kind = index::SymbolKind::Module;
+  HI.Documentation = std::move(Documentation);
+  HI.Definition = "module " + Imported->getFullModuleName();
+  return HI;
+}
+
 void maybeAddUsedSymbols(ParsedAST &AST, HoverInfo &HI, const Inclusion &Inc) {
   auto Converted = convertIncludes(AST);
   llvm::DenseSet<include_cleaner::Symbol> UsedSymbols;
@@ -1310,6 +1423,13 @@ std::optional<HoverInfo> getHover(ParsedAST &AST, Position Pos,
                                   include_cleaner::Symbol{IncludeCleanerMacro});
         }
         break;
+      }
+      if (const auto *ID = locateModuleImport(Tok, AST)) {
+        if (auto ImportHI = getHoverContents(*ID, AST.getASTContext())) {
+          HoverCountMetric.record(1, "module-import");
+          HI = std::move(*ImportHI);
+          break;
+        }
       }
     } else if (Tok.kind() == tok::kw_auto || Tok.kind() == tok::kw_decltype) {
       HoverCountMetric.record(1, "keyword");
