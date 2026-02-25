@@ -894,6 +894,64 @@ void func() {
               testing::HasSubstr("Print A value."));
 }
 
+TEST_F(PrerequisiteModulesTests, CodeCompleteModuleDocsFromPrebuiltNamedModule) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+/// Print A value.
+export void printA();
+  )cpp");
+
+  llvm::StringLiteral UserContents = R"cpp(
+import A;
+void func() {
+  print^
+}
+)cpp";
+  CDB.addFile("Use.cpp", UserContents);
+  Annotations Test(UserContents);
+
+  ModulesBuilder Builder(CDB);
+  auto BuiltModules =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(BuiltModules);
+
+  HeaderSearchOptions HSOpts(TestDir);
+  BuiltModules->adjustHeaderSearchOptions(HSOpts);
+  auto It = HSOpts.PrebuiltModuleFiles.find("A");
+  ASSERT_NE(It, HSOpts.PrebuiltModuleFiles.end());
+  ASSERT_TRUE(llvm::sys::fs::exists(It->second));
+
+  CDB.ExtraClangFlags.push_back("-fmodule-file=A=" + It->second);
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto Result = codeComplete(getFullPath("Use.cpp"), Test.point(),
+                             Preamble.get(), Use, {});
+  ASSERT_FALSE(Result.Completions.empty());
+
+  const CodeCompletion *PrintA = nullptr;
+  for (const auto &Completion : Result.Completions) {
+    if (Completion.Name == "printA") {
+      PrintA = &Completion;
+      break;
+    }
+  }
+  ASSERT_TRUE(PrintA);
+  ASSERT_TRUE(PrintA->Documentation);
+  EXPECT_THAT(PrintA->Documentation->asPlainText(),
+              testing::HasSubstr("Print A value."));
+}
+
 TEST_F(PrerequisiteModulesTests, ModuleInternalMacroNotCompletedInImporter) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
