@@ -815,6 +815,107 @@ import M;
   EXPECT_EQ(HS.PrebuiltModuleFiles, HS2.PrebuiltModuleFiles);
 }
 
+TEST_F(PrerequisiteModulesTests, ReuseRejectsCompileCommandMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=1");
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.ExtraClangFlags.pop_back();
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=2");
+  auto NewInvocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(NewInvocation);
+  EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, CacheRejectsCompileCommandMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=1");
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto FirstInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(FirstInfo);
+  HeaderSearchOptions FirstHS(TestDir);
+  FirstInfo->adjustHeaderSearchOptions(FirstHS);
+  ASSERT_TRUE(FirstHS.PrebuiltModuleFiles.count("M"));
+  std::string FirstModulePath = FirstHS.PrebuiltModuleFiles["M"];
+
+  CDB.ExtraClangFlags.pop_back();
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=2");
+  auto SecondInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(SecondInfo);
+  HeaderSearchOptions SecondHS(TestDir);
+  SecondInfo->adjustHeaderSearchOptions(SecondHS);
+  ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, PrebuiltRejectsCompileCommandMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=1");
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+  HeaderSearchOptions HS(TestDir);
+  ModuleInfo->adjustHeaderSearchOptions(HS);
+  ASSERT_TRUE(HS.PrebuiltModuleFiles.count("M"));
+  std::string OldPrebuiltPath = HS.PrebuiltModuleFiles["M"];
+
+  CDB.ExtraClangFlags.pop_back();
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=2");
+  CDB.ExtraClangFlags.push_back("-fmodule-file=M=" + OldPrebuiltPath);
+  ModulesBuilder Builder2(CDB);
+  auto ModuleInfo2 =
+      Builder2.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo2);
+  HeaderSearchOptions HS2(TestDir);
+  ModuleInfo2->adjustHeaderSearchOptions(HS2);
+  ASSERT_TRUE(HS2.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(OldPrebuiltPath, HS2.PrebuiltModuleFiles["M"]);
+}
+
 } // namespace
 } // namespace clang::clangd
 

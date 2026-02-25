@@ -266,8 +266,16 @@ private:
 
 bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
-                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                          const CompilerInvocation *CI = nullptr) {
   HeaderSearchOptions HSOpts;
+  LangOptions LangOpts;
+  PreprocessorOptions PPOpts;
+  if (CI) {
+    HSOpts = CI->getHeaderSearchOpts();
+    LangOpts = CI->getLangOpts();
+    PPOpts = CI->getPreprocessorOpts();
+  }
   RequisiteModules.adjustHeaderSearchOptions(HSOpts);
   HSOpts.ForceCheckCXX20ModulesInputFiles = true;
   HSOpts.ValidateASTInputFilesContent = true;
@@ -278,17 +286,14 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
       CompilerInstance::createDiagnostics(*VFS, DiagOpts, &IgnoreDiags,
                                           /*ShouldOwnClient=*/false);
 
-  LangOptions LangOpts;
+  // In clang's driver, we suppress ODR checks in GMF while building modules.
+  // Keep validation aligned with that mode to avoid mismatched acceptance.
   LangOpts.SkipODRCheckInGMF = true;
 
   FileManager FileMgr(FileSystemOptions(), VFS);
-
   SourceManager SourceMgr(*Diags, FileMgr);
-
   HeaderSearch HeaderInfo(HSOpts, SourceMgr, *Diags, LangOpts,
                           /*Target=*/nullptr);
-
-  PreprocessorOptions PPOpts;
   TrivialModuleLoader ModuleLoader;
   Preprocessor PP(PPOpts, *Diags, LangOpts, SourceMgr, HeaderInfo,
                   ModuleLoader);
@@ -303,9 +308,12 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
   // listener.
   Reader.setListener(nullptr);
 
+  const unsigned ValidationCaps =
+      ASTReader::ARR_OutOfDate | ASTReader::ARR_Missing |
+      ASTReader::ARR_ConfigurationMismatch |
+      ASTReader::ARR_TreatModuleWithErrorsAsOutOfDate;
   if (Reader.ReadAST(ModuleFilePath, serialization::MK_MainFile,
-                     SourceLocation(),
-                     ASTReader::ARR_None) != ASTReader::Success)
+                     SourceLocation(), ValidationCaps) != ASTReader::Success)
     return false;
 
   bool UpToDate = true;
@@ -321,13 +329,13 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
   return UpToDate;
 }
 
-bool IsModuleFilesUpToDate(
-    llvm::SmallVector<PathRef> ModuleFilePaths,
-    const PrerequisiteModules &RequisiteModules,
-    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+bool IsModuleFilesUpToDate(llvm::SmallVector<PathRef> ModuleFilePaths,
+                           const PrerequisiteModules &RequisiteModules,
+                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                           const CompilerInvocation &CI) {
   return llvm::all_of(
-      ModuleFilePaths, [&RequisiteModules, VFS](auto ModuleFilePath) {
-        return IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS);
+      ModuleFilePaths, [&RequisiteModules, VFS, &CI](auto ModuleFilePath) {
+        return IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS, &CI);
       });
 }
 
@@ -423,7 +431,7 @@ bool ReusablePrerequisiteModules::canReuse(
   llvm::SmallVector<llvm::StringRef> BMIPaths;
   for (auto &MF : RequiredModules)
     BMIPaths.push_back(MF->getModuleFilePath());
-  return IsModuleFilesUpToDate(BMIPaths, *this, VFS);
+  return IsModuleFilesUpToDate(BMIPaths, *this, VFS, CI);
 }
 
 class ModuleFileCache {
@@ -651,7 +659,7 @@ void ModulesBuilder::ModulesBuilderImpl::getPrebuiltModuleFile(
       continue;
 
     if (IsModuleFileUpToDate(ModuleFilePath, BuiltModuleFiles,
-                             TFS.view(std::nullopt))) {
+                             TFS.view(std::nullopt), CI.get())) {
       log("Reusing prebuilt module file {0} of module {1} for {2}",
           ModuleFilePath, ModuleName, ModuleUnitFileName);
       BuiltModuleFiles.addModuleFile(
@@ -696,9 +704,19 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
       return llvm::createStringError(llvm::formatv(
           "Don't get the module unit for module {0}", ReqModuleName));
 
+    std::unique_ptr<CompilerInvocation> ReqCI;
+    if (auto ReqCmd = getCDB().getCompileCommand(ReqFileName)) {
+      ParseInputs Inputs;
+      Inputs.TFS = &TFS;
+      Inputs.CompileCommand = std::move(*ReqCmd);
+      IgnoreDiagnostics IgnoreDiags;
+      ReqCI = buildCompilerInvocation(Inputs, IgnoreDiags);
+    }
+
     if (auto Cached = Cache.getModule(ReqModuleName, ReqFileName)) {
-      if (IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
-                               TFS.view(std::nullopt))) {
+      if (ReqCI &&
+          IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
+                               TFS.view(std::nullopt), ReqCI.get())) {
         log("Reusing module {0} from {1}", ReqModuleName,
             Cached->getModuleFilePath());
         BuiltModuleFiles.addModuleFile(std::move(Cached));
