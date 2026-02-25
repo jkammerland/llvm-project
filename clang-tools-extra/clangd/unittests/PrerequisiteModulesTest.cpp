@@ -535,6 +535,79 @@ int use() {
   EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("M"));
 }
 
+TEST_F(PrerequisiteModulesTests, ModulesPreambleCompatibility) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+export void printA();
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+#define HAS_PREAMBLE 1
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+import A;
+void foo() {}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+  EXPECT_TRUE(isPreambleCompatible(*Preamble, Use, getFullPath("Use.cpp"), *CI));
+}
+
+TEST_F(PrerequisiteModulesTests, IncludeDrivenImportInMainAST) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+export void printA();
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+import A;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+void foo() {
+  printA();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+
+  auto AST = ParsedAST::build(getFullPath("Use.cpp"), Use, std::move(CI), {},
+                              Preamble);
+  ASSERT_TRUE(AST);
+
+  const NamedDecl &D = findDecl(*AST, "printA");
+  EXPECT_TRUE(D.isFromASTFile());
+}
+
 // An End-to-End test for modules.
 TEST_F(PrerequisiteModulesTests, ParsedASTTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);

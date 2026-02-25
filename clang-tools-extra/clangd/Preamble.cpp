@@ -567,6 +567,18 @@ public:
 };
 } // namespace
 
+static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
+                                                 const CompilerInvocation &CI,
+                                                 llvm::MemoryBufferRef Buffer) {
+  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), Buffer, 0);
+  // Imports inside headers included by the preamble aren't reliably reflected
+  // in the patched main AST under experimental modules support. Keep the
+  // preamble empty in that mode so such imports are parsed in the main AST.
+  if (Inputs.ModulesManager && Bounds.Size != 0)
+    return {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
+  return Bounds;
+}
+
 std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
               const ParseInputs &Inputs, bool StoreInMemory,
@@ -576,12 +588,8 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   // without those.
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
-  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *ContentsBuffer, 0);
-  // Imports inside headers included by the preamble aren't reliably reflected
-  // in the patched main AST under experimental modules support. Keep the
-  // preamble empty in that mode so such imports are parsed in the main AST.
-  if (Inputs.ModulesManager && Bounds.Size != 0)
-    Bounds = {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
+  auto Bounds =
+      getPreambleBoundsForInputs(Inputs, CI, ContentsBuffer->getMemBufferRef());
 
   trace::Span Tracer("BuildPreamble");
   SPAN_ATTACH(Tracer, "File", FileName);
@@ -738,7 +746,8 @@ bool isPreambleCompatible(const PreambleData &Preamble,
                           const CompilerInvocation &CI) {
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
-  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *ContentsBuffer, 0);
+  auto Bounds =
+      getPreambleBoundsForInputs(Inputs, CI, ContentsBuffer->getMemBufferRef());
   auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
   return compileCommandsAreEqual(Inputs.CompileCommand,
                                  Preamble.CompileCommand) &&

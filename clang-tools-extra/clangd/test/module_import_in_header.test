@@ -81,8 +81,10 @@ void foo() {
 # CHECK: "message"{{.*}}printA{{.*}}(fix available)
 
 ---
-{"jsonrpc":"2.0","id":1,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":6}}}
+{"jsonrpc":"2.0","id":1,"method":"sync","params":{}}
 ---
-{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":6}}}
+---
+{"jsonrpc":"2.0","id":3,"method":"shutdown"}
 ---
 {"jsonrpc":"2.0","method":"exit"}
