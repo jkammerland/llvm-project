@@ -1,0 +1,142 @@
+# Async module-library stress test:
+# overlapping feature requests with explicit cancellation must not crash/hang,
+# and later requests should still complete.
+#
+# Windows have different escaping modes.
+# FIXME: We should add one for windows.
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -fr %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test -sync=0 < %t/definition.jsonrpc \
+# RUN:      2> %t.err | tee %t.out
+# RUN: grep -F "\"id\": 20," %t.out
+# RUN: grep -F "\"id\": 30," %t.out
+# RUN: grep -F "\"id\": 31," %t.out
+# RUN: grep -F "\"id\": 32," %t.out
+# RUN: grep -F "\"id\": 33," %t.out
+# RUN: grep -F "\"filterText\": \"printA\"" %t.out
+# RUN: grep -F "\"name\": \"printA\"" %t.out
+# RUN: grep -F "\"code\": -32800" %t.out
+
+#--- A.cppm
+/// Module docs for A.
+export module A;
+export void printA() {}
+
+#--- Use.cpp
+import A;
+void foo() {
+    pri
+    printA();
+}
+
+#--- compile_commands.json.tmpl
+[
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/Use.cpp.o -c DIR/Use.cpp",
+      "file": "DIR/Use.cpp"
+    },
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
+      "file": "DIR/A.cppm"
+    }
+]
+
+#--- definition.jsonrpc.tmpl
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "initialize",
+  "params": {
+    "processId": 123,
+    "rootPath": "clangd",
+    "capabilities": {
+      "textDocument": {
+        "completion": {
+          "completionItem": {
+            "snippetSupport": true
+          }
+        }
+      }
+    },
+    "trace": "off"
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "import A;\nvoid foo() {\n    pri\n    printA();\n}\n"
+    }
+  }
+}
+---
+{"jsonrpc":"2.0","id":10,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":11,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":12,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":13,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":14,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":15,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":16,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":17,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":18,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":0,"character":7}}}
+---
+{"jsonrpc":"2.0","id":19,"method":"textDocument/references","params":{
+  "textDocument":{"uri":"file://DIR/Use.cpp"},
+  "position":{"line":3,"character":4},
+  "context":{"includeDeclaration":true}
+}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":10}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":11}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":12}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":13}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":14}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":15}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":16}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":17}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":18}}
+---
+{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":19}}
+---
+{"jsonrpc":"2.0","id":20,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":30,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":31,"method":"workspace/symbol","params":{"query":"printA"}}
+---
+{"jsonrpc":"2.0","id":32,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":33,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}

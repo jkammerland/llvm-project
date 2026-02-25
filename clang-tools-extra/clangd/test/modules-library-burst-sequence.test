@@ -1,0 +1,106 @@
+# Async burst test for module-library features:
+# fire completion/references/rename/workspace-symbol back-to-back with minimal
+# barriers and verify all responses arrive.
+#
+# Windows have different escaping modes.
+# FIXME: We should add one for windows.
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -fr %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test -sync=0 < %t/definition.jsonrpc \
+# RUN:      2> %t.err | tee %t.out
+# RUN: grep -F "\"id\": 1," %t.out
+# RUN: grep -F "\"id\": 2," %t.out
+# RUN: grep -F "\"id\": 3," %t.out
+# RUN: grep -F "\"id\": 4," %t.out
+# RUN: grep -F "\"id\": 5," %t.out
+# RUN: grep -F "\"id\": 6," %t.out
+# RUN: grep -F "\"filterText\": \"printA\"" %t.out
+
+#--- A.cppm
+export module A;
+export void printA() {}
+
+#--- Use.cpp
+import A;
+void foo() {
+    pri
+    printA();
+}
+
+#--- compile_commands.json.tmpl
+[
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/Use.cpp.o -c DIR/Use.cpp",
+      "file": "DIR/Use.cpp"
+    },
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
+      "file": "DIR/A.cppm"
+    }
+]
+
+#--- definition.jsonrpc.tmpl
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "initialize",
+  "params": {
+    "processId": 123,
+    "rootPath": "clangd",
+    "capabilities": {
+      "textDocument": {
+        "rename": {
+          "dynamicRegistration": true,
+          "prepareSupport": true
+        },
+        "completion": {
+          "completionItem": {
+            "snippetSupport": true
+          }
+        }
+      }
+    },
+    "trace": "off"
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "import A;\nvoid foo() {\n    pri\n    printA();\n}\n"
+    }
+  }
+}
+---
+{"jsonrpc":"2.0","id":1,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+---
+{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{
+  "textDocument":{"uri":"file://DIR/Use.cpp"},
+  "position":{"line":3,"character":4},
+  "context":{"includeDeclaration":true}
+}}
+---
+{"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":3,"character":4},"newName":"printBurst"}}
+---
+{"jsonrpc":"2.0","id":4,"method":"workspace/symbol","params":{"query":"printA"}}
+---
+{"jsonrpc":"2.0","id":5,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":6,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}
