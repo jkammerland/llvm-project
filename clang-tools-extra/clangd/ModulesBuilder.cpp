@@ -416,6 +416,7 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
   // Preserve doc comments in clangd-built BMIs so code-intelligence features
   // (e.g. completion docs) can surface comments from imported modules.
   CI->getPreprocessorOpts().WriteCommentListToPCH = true;
+  CI->getPreprocessorOpts().WriteCommentListToNamedModules = true;
 
   BuiltModuleFiles.adjustHeaderSearchOptions(CI->getHeaderSearchOpts());
   const std::string ModuleContextHash = CI->computeContextHash();
