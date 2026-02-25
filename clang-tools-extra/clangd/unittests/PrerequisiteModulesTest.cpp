@@ -162,6 +162,86 @@ private:
   std::string TestDir;
 };
 
+class SourceSwitchingProjectModules : public ProjectModules {
+public:
+  SourceSwitchingProjectModules(llvm::StringRef PrimarySource,
+                                llvm::StringRef AlternateSource,
+                                const bool &UseAlternateSource)
+      : PrimarySource(PrimarySource.str()),
+        AlternateSource(AlternateSource.str()),
+        UseAlternateSource(UseAlternateSource) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    if (llvm::sys::path::filename(File) == "Use.cpp")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    if (File == PrimarySource)
+      return UseAlternateSource ? "NotM" : "M";
+    if (File == AlternateSource)
+      return UseAlternateSource ? "M" : "NotM";
+    return "";
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef) override {
+    if (ModuleName != "M")
+      return "";
+    return UseAlternateSource ? AlternateSource : PrimarySource;
+  }
+
+private:
+  std::string PrimarySource;
+  std::string AlternateSource;
+  const bool &UseAlternateSource;
+};
+
+class SourceSwitchingCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  SourceSwitchingCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setUseAlternateSource(bool Value) { UseAlternateSource = Value; }
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    llvm::SmallString<256> PrimarySource(Directory);
+    llvm::sys::path::append(PrimarySource, "M-primary.cppm");
+    llvm::SmallString<256> AlternateSource(Directory);
+    llvm::sys::path::append(AlternateSource, "M-alternate.cppm");
+    return std::make_unique<SourceSwitchingProjectModules>(
+        PrimarySource.str(), AlternateSource.str(), UseAlternateSource);
+  }
+
+private:
+  mutable bool UseAlternateSource = false;
+};
+
+class ModuleUnitFlagCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  ModuleUnitFlagCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setModuleFlagValue(int Value) { ModuleFlagValue = Value; }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+    if (llvm::sys::path::filename(File) == "M.cppm")
+      Cmd->CommandLine.push_back("-DMODULE_FLAG=" +
+                                 std::to_string(ModuleFlagValue));
+    return Cmd;
+  }
+
+private:
+  int ModuleFlagValue = 1;
+};
+
 // Add files to the working testing directory and the compilation database.
 void MockDirectoryCompilationDatabase::addFile(llvm::StringRef Path,
                                                llvm::StringRef Contents) {
@@ -1062,6 +1142,74 @@ import M;
   EXPECT_EQ(HS.PrebuiltModuleFiles, HS2.PrebuiltModuleFiles);
 }
 
+TEST_F(PrerequisiteModulesTests, CacheRejectsSourceRemapWithSameModuleName) {
+  SourceSwitchingCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M-primary.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("M-alternate.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 2;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto FirstInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(FirstInfo);
+  HeaderSearchOptions FirstHS(TestDir);
+  FirstInfo->adjustHeaderSearchOptions(FirstHS);
+  ASSERT_TRUE(FirstHS.PrebuiltModuleFiles.count("M"));
+  std::string FirstModulePath = FirstHS.PrebuiltModuleFiles["M"];
+
+  CDB.setUseAlternateSource(true);
+  auto SecondInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(SecondInfo);
+  HeaderSearchOptions SecondHS(TestDir);
+  SecondInfo->adjustHeaderSearchOptions(SecondHS);
+  ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, CacheRejectsModuleUnitCompileFlagsMismatch) {
+  ModuleUnitFlagCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto FirstInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(FirstInfo);
+  HeaderSearchOptions FirstHS(TestDir);
+  FirstInfo->adjustHeaderSearchOptions(FirstHS);
+  ASSERT_TRUE(FirstHS.PrebuiltModuleFiles.count("M"));
+  std::string FirstModulePath = FirstHS.PrebuiltModuleFiles["M"];
+
+  CDB.setModuleFlagValue(2);
+  auto SecondInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(SecondInfo);
+  HeaderSearchOptions SecondHS(TestDir);
+  SecondInfo->adjustHeaderSearchOptions(SecondHS);
+  ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
 TEST_F(PrerequisiteModulesTests, ReuseRejectsCompileCommandMismatch) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
@@ -1091,6 +1239,39 @@ int UseM = MValue;
       buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
   ASSERT_TRUE(NewInvocation);
   EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseRejectsContextHashMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  HeaderSearchOptions HS(TestDir);
+  ModuleInfo->adjustHeaderSearchOptions(HS);
+  ASSERT_TRUE(HS.PrebuiltModuleFiles.count("M"));
+
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(HS.PrebuiltModuleFiles["M"] + ".ctxhash", EC);
+  ASSERT_FALSE(EC);
+  OS << "manually-mismatched-context-hash";
+  OS.close();
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_FALSE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
 TEST_F(PrerequisiteModulesTests, CacheRejectsCompileCommandMismatch) {
