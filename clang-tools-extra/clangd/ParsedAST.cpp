@@ -34,6 +34,7 @@
 #include "clang/AST/DeclGroup.h"
 #include "clang/AST/ExternalASTSource.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/Basic/CharInfo.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticIDs.h"
 #include "clang/Basic/DiagnosticSema.h"
@@ -88,6 +89,44 @@ namespace {
 
 template <class T> std::size_t getUsedBytes(const std::vector<T> &Vec) {
   return Vec.capacity() * sizeof(T);
+}
+
+llvm::StringRef skipLeadingWhitespaceAndComments(llvm::StringRef Code) {
+  while (true) {
+    Code = Code.ltrim();
+
+    // Ignore a potential UTF-8 BOM in the buffer start.
+    if (Code.consume_front("\xEF\xBB\xBF"))
+      continue;
+
+    if (Code.consume_front("//")) {
+      size_t NewlinePos = Code.find('\n');
+      if (NewlinePos == llvm::StringRef::npos)
+        return "";
+      Code = Code.drop_front(NewlinePos + 1);
+      continue;
+    }
+
+    if (Code.consume_front("/*")) {
+      size_t EndComment = Code.find("*/");
+      if (EndComment == llvm::StringRef::npos)
+        return "";
+      Code = Code.drop_front(EndComment + 2);
+      continue;
+    }
+
+    return Code;
+  }
+}
+
+bool hasLeadingGlobalModuleFragment(llvm::StringRef Code) {
+  Code = skipLeadingWhitespaceAndComments(Code);
+  if (!Code.consume_front("module"))
+    return false;
+  if (!Code.empty() && isAsciiIdentifierContinue(Code.front()))
+    return false;
+  Code = skipLeadingWhitespaceAndComments(Code);
+  return Code.consume_front(";");
 }
 
 class DeclTrackingASTConsumer : public ASTConsumer {
@@ -450,9 +489,8 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
 
   // Adjust header search options to load the built module files recorded
   // in RequiredModules.
-  if (Preamble && Preamble->RequiredModules)
-    Preamble->RequiredModules->adjustHeaderSearchOptions(
-        CI->getHeaderSearchOpts());
+  if (Preamble)
+    applyRequiredModulesSettings(Preamble->RequiredModules.get(), *CI);
 
   std::optional<PreamblePatch> Patch;
   // We might use an ignoring diagnostic consumer if they are going to be
@@ -542,6 +580,8 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   auto BuildDir = VFS->getCurrentWorkingDirectory();
   std::optional<IncludeFixer> FixIncludes;
   llvm::DenseMap<diag::kind, DiagnosticsEngine::Level> OverriddenSeverity;
+  const bool HasLeadingGlobalModuleFragment =
+      Inputs.ModulesManager && hasLeadingGlobalModuleFragment(Inputs.Contents);
   // No need to run clang-tidy or IncludeFixerif we are not going to surface
   // diagnostics.
   {
@@ -588,6 +628,13 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
       if (Cfg.Diagnostics.SuppressAll ||
           isDiagnosticSuppressed(Info, Cfg.Diagnostics.Suppress,
                                  Clang->getLangOpts()))
+        return DiagnosticsEngine::Ignored;
+
+      // FIXME: remove this once clangd's modules workflow no longer reports
+      // err_module_decl_not_at_start in files that start with `module;`.
+      if (HasLeadingGlobalModuleFragment &&
+          (Info.getID() == diag::err_module_decl_not_at_start ||
+           Info.getID() == diag::note_global_module_introducer_missing))
         return DiagnosticsEngine::Ignored;
 
       auto It = OverriddenSeverity.find(Info.getID());

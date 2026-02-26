@@ -567,6 +567,18 @@ public:
 };
 } // namespace
 
+static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
+                                                 const CompilerInvocation &CI,
+                                                 llvm::MemoryBufferRef Buffer) {
+  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), Buffer, 0);
+  // Imports inside headers included by the preamble aren't reliably reflected
+  // in the patched main AST under experimental modules support. Keep the
+  // preamble empty in that mode so such imports are parsed in the main AST.
+  if (Inputs.ModulesManager && Bounds.Size != 0)
+    return {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
+  return Bounds;
+}
+
 std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
               const ParseInputs &Inputs, bool StoreInMemory,
@@ -576,7 +588,8 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   // without those.
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
-  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *ContentsBuffer, 0);
+  auto Bounds =
+      getPreambleBoundsForInputs(Inputs, CI, ContentsBuffer->getMemBufferRef());
 
   trace::Span Tracer("BuildPreamble");
   SPAN_ATTACH(Tracer, "File", FileName);
@@ -636,6 +649,22 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   auto StatCacheFS = StatCache->getProducingFS(VFS);
   llvm::IntrusiveRefCntPtr<TimerFS> TimedFS(new TimerFS(StatCacheFS));
 
+  std::unique_ptr<PrerequisiteModules> RequiredModules;
+  if (Inputs.ModulesManager) {
+    WallTimer PrerequisiteModuleTimer;
+    PrerequisiteModuleTimer.startTimer();
+    RequiredModules =
+        Inputs.ModulesManager->buildPrerequisiteModulesFor(FileName,
+                                                           *Inputs.TFS);
+    PrerequisiteModuleTimer.stopTimer();
+
+    if (RequiredModules)
+      RequiredModules->adjustHeaderSearchOptions(CI.getHeaderSearchOpts());
+
+    log("Built prerequisite modules for file {0} in {1} seconds", FileName,
+        PrerequisiteModuleTimer.getTime());
+  }
+
   WallTimer PreambleTimer;
   PreambleTimer.startTimer();
   auto BuiltPreamble = PrecompiledPreamble::Build(
@@ -675,17 +704,7 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
     Result->Pragmas = std::make_shared<const include_cleaner::PragmaIncludes>(
         CapturedInfo.takePragmaIncludes());
 
-    if (Inputs.ModulesManager) {
-      WallTimer PrerequisiteModuleTimer;
-      PrerequisiteModuleTimer.startTimer();
-      Result->RequiredModules =
-          Inputs.ModulesManager->buildPrerequisiteModulesFor(FileName,
-                                                             *Inputs.TFS);
-      PrerequisiteModuleTimer.stopTimer();
-
-      log("Built prerequisite modules for file {0} in {1} seconds", FileName,
-          PrerequisiteModuleTimer.getTime());
-    }
+    Result->RequiredModules = std::move(RequiredModules);
 
     Result->Macros = CapturedInfo.takeMacros();
     Result->Marks = CapturedInfo.takeMarks();
@@ -727,7 +746,8 @@ bool isPreambleCompatible(const PreambleData &Preamble,
                           const CompilerInvocation &CI) {
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
-  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *ContentsBuffer, 0);
+  auto Bounds =
+      getPreambleBoundsForInputs(Inputs, CI, ContentsBuffer->getMemBufferRef());
   auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
   return compileCommandsAreEqual(Inputs.CompileCommand,
                                  Preamble.CompileCommand) &&

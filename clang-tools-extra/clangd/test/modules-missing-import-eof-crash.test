@@ -1,0 +1,77 @@
+# Regression test for #181358.
+#
+# Missing module import at EOF used to crash clangd when parsing stopped early.
+#
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test -sync=0 < %t/definition.jsonrpc \
+# RUN:      2> %t.err | tee %t.out | FileCheck -strict-whitespace %s --check-prefix=OUT
+# RUN: grep -F "\"method\": \"textDocument/publishDiagnostics\"" %t.out | count 1
+
+#--- Use.cpp
+import NonExistent;
+
+#--- compile_commands.json.tmpl
+[
+  {
+    "directory": "DIR",
+    "command": "CLANG_CC -std=c++20 -o DIR/Use.cpp.o -c DIR/Use.cpp",
+    "file": "DIR/Use.cpp"
+  }
+]
+
+#--- definition.jsonrpc.tmpl
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "initialize",
+  "params": {
+    "processId": 123,
+    "rootPath": "clangd",
+    "capabilities": {},
+    "trace": "off"
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "import NonExistent;"
+    }
+  }
+}
+---
+{"jsonrpc":"2.0","id":1,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":2,"method":"sync","params":{}}
+---
+{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}
+
+# OUT: "method": "textDocument/publishDiagnostics"
+# OUT: "code": "module_not_found"
+# OUT: "message": "Module 'NonExistent' not found"
+# OUT: "version": 1
+# OUT: "id": 1,
+# OUT-NEXT:  "jsonrpc": "2.0",
+# OUT-NEXT:  "result": null
+# OUT: "id": 2,
+# OUT-NEXT:  "jsonrpc": "2.0",
+# OUT-NEXT:  "result": null
+# OUT: "id": 3,
+# OUT-NEXT:  "jsonrpc": "2.0",
+# OUT-NEXT:  "result": null

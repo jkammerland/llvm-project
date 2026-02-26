@@ -20,6 +20,18 @@ namespace {
 
 using testing::IsEmpty;
 
+class FakePrerequisiteModules : public PrerequisiteModules {
+public:
+  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {
+    Options.PrebuiltModuleFiles["M"] = "/tmp/M.pcm";
+  }
+
+  bool canReuse(const CompilerInvocation &,
+                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>) const override {
+    return true;
+  }
+};
+
 TEST(BuildCompilerInvocation, DropsPCH) {
   MockFS FS;
   IgnoreDiagnostics Diags;
@@ -112,6 +124,17 @@ TEST(BuildCompilerInvocation, EmptyArgs) {
 
   // No crash.
   EXPECT_EQ(buildCompilerInvocation(Inputs, Diags), nullptr);
+}
+
+TEST(ApplyRequiredModulesSettings, EnablesSkipODRCheckInGMF) {
+  CompilerInvocation CI;
+  FakePrerequisiteModules Modules;
+
+  EXPECT_FALSE(CI.getLangOpts().SkipODRCheckInGMF);
+  applyRequiredModulesSettings(&Modules, CI);
+
+  EXPECT_TRUE(CI.getLangOpts().SkipODRCheckInGMF);
+  EXPECT_EQ(CI.getHeaderSearchOpts().PrebuiltModuleFiles["M"], "/tmp/M.pcm");
 }
 } // namespace
 } // namespace clangd

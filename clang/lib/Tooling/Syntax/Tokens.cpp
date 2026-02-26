@@ -891,6 +891,15 @@ private:
 };
 
 TokenBuffer TokenCollector::consume() && {
+  if (Expanded.empty() || Expanded.back().kind() != tok::eof) {
+    // Parsing may stop early (e.g. after fatal module-loader failures), leaving
+    // the preprocessor stream undrained. Ensure we always capture the trailing
+    // eof token so TokenBuffer invariants are preserved.
+    clang::Token T;
+    do {
+      PP.Lex(T);
+    } while (T.getKind() != tok::eof);
+  }
   PP.setTokenWatcher(nullptr);
   Collector->disable();
   return Builder(std::move(Expanded), std::move(Expansions),

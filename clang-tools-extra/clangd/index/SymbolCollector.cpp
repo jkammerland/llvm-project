@@ -526,9 +526,11 @@ bool SymbolCollector::shouldCollectSymbol(const NamedDecl &ND,
 
   // We want most things but not "local" symbols such as symbols inside
   // FunctionDecl, BlockDecl, ObjCMethodDecl and OMPDeclareReductionDecl.
-  // FIXME: Need a matcher for ExportDecl in order to include symbols declared
-  // within an export.
-  const auto *DeclCtx = ND.getDeclContext();
+  // `export` wraps declarations in an ExportDecl that is not itself a
+  // visibility boundary for indexing, so look through it.
+  const DeclContext *DeclCtx = ND.getDeclContext();
+  while (const auto *ED = dyn_cast<ExportDecl>(DeclCtx))
+    DeclCtx = ED->getDeclContext();
   switch (DeclCtx->getDeclKind()) {
   case Decl::TranslationUnit:
   case Decl::Namespace:
@@ -553,7 +555,7 @@ bool SymbolCollector::shouldCollectSymbol(const NamedDecl &ND,
 
   // System headers that end with `intrin.h` likely contain useful symbols.
   if (!Opts.CollectReserved &&
-      (hasReservedName(ND) || hasReservedScope(*ND.getDeclContext())) &&
+      (hasReservedName(ND) || hasReservedScope(*DeclCtx)) &&
       ASTCtx.getSourceManager().isInSystemHeader(ND.getLocation()) &&
       !ASTCtx.getSourceManager()
            .getFilename(ND.getLocation())

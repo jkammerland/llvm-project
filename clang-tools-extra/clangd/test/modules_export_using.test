@@ -1,0 +1,137 @@
+# Check that symbols re-exported from a module interface via export-using are
+# discoverable in importers for completion/xrefs/rename/workspace symbol.
+#
+# Windows have different escaping modes.
+# FIXME: We should add one for windows.
+# UNSUPPORTED: system-windows
+#
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: split-file %s %t
+#
+# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
+# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
+#
+# RUN: clangd -experimental-modules-support -lit-test < %t/definition.jsonrpc \
+# RUN:      | FileCheck -strict-whitespace %t/definition.jsonrpc
+
+#--- foo.h
+void printA() {}
+
+#--- A.cppm
+module;
+#include "foo.h"
+export module A;
+export using ::printA;
+
+#--- Use.cpp
+import A;
+void foo() {
+    pri
+    printA();
+}
+
+#--- compile_commands.json.tmpl
+[
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/main.cpp.o -c DIR/Use.cpp",
+      "file": "DIR/Use.cpp"
+    },
+    {
+      "directory": "DIR",
+      "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
+      "file": "DIR/A.cppm"
+    }
+]
+
+#--- definition.jsonrpc.tmpl
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "initialize",
+  "params": {
+    "processId": 123,
+    "rootPath": "clangd",
+    "capabilities": {
+      "textDocument": {
+        "rename": {
+          "dynamicRegistration": true,
+          "prepareSupport": true
+        },
+        "completion": {
+          "completionItem": {
+            "snippetSupport": true
+          }
+        }
+      }
+    },
+    "trace": "off"
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/A.cppm",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "module;\n#include \"foo.h\"\nexport module A;\nexport using ::printA;\n"
+    }
+  }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didOpen",
+  "params": {
+    "textDocument": {
+      "uri": "file://DIR/Use.cpp",
+      "languageId": "cpp",
+      "version": 1,
+      "text": "import A;\nvoid foo() {\n    pri\n    printA();\n}\n"
+    }
+  }
+}
+
+---
+{"jsonrpc":"2.0","id":1,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":4}}}
+# CHECK: "filterText": "printA"
+---
+{"jsonrpc":"2.0","id":3,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":4,"method":"textDocument/references","params":{
+  "textDocument":{"uri":"file://DIR/Use.cpp"},
+  "position":{"line":3,"character":4},
+  "context":{"includeDeclaration":true}
+}}
+# CHECK: "id": 4,
+# CHECK: "result": [
+# CHECK-DAG: "uri": "file://{{.*}}/Use.cpp"
+# CHECK-DAG: "uri": "file://{{.*}}/A.cppm"
+---
+{"jsonrpc":"2.0","id":5,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":6,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"position":{"line":3,"character":4},"newName":"printRenamed"}}
+# CHECK: "id": 6,
+# CHECK: "result": {
+# CHECK: "changes": {
+# CHECK-DAG: "file://{{.*}}/A.cppm": [
+# CHECK-DAG: "file://{{.*}}/Use.cpp": [
+---
+{"jsonrpc":"2.0","id":7,"method":"sync","params":null}
+---
+{"jsonrpc":"2.0","id":8,"method":"workspace/symbol","params":{"query":"printA"}}
+# CHECK: "id": 8,
+# CHECK: "result": [
+# CHECK: "name": "printA"
+# CHECK: "uri": "file://{{.*}}/A.cppm"
+---
+{"jsonrpc":"2.0","id":9,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}

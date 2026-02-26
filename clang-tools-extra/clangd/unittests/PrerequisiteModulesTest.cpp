@@ -104,6 +104,144 @@ private:
   mutable std::atomic<unsigned> GlobalScanningCount;
 };
 
+class FilenameSensitiveProjectModules : public ProjectModules {
+public:
+  explicit FilenameSensitiveProjectModules(PathRef TestDir)
+      : TestDir(TestDir.str()) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "UseA.cpp" || FileName == "UseB.cpp")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "M-A.cppm" || FileName == "M-B.cppm")
+      return "M";
+    return {};
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) override {
+    if (ModuleName != "M")
+      return {};
+
+    llvm::StringRef RequiredFileName =
+        llvm::sys::path::filename(RequiredSrcFile);
+    if (RequiredFileName == "UseA.cpp" || RequiredFileName == "M-A.cppm")
+      return getPathFor("M-A.cppm");
+    if (RequiredFileName == "UseB.cpp" || RequiredFileName == "M-B.cppm")
+      return getPathFor("M-B.cppm");
+    return {};
+  }
+
+private:
+  std::string getPathFor(llvm::StringRef RelativePath) const {
+    llvm::SmallString<128> FullPath(TestDir);
+    llvm::sys::path::append(FullPath, RelativePath);
+    return FullPath.str().str();
+  }
+
+  std::string TestDir;
+};
+
+class FilenameSensitiveMockDirectoryCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  FilenameSensitiveMockDirectoryCompilationDatabase(StringRef TestDir,
+                                                    const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS), TestDir(TestDir) {}
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    return std::make_unique<FilenameSensitiveProjectModules>(TestDir);
+  }
+
+private:
+  std::string TestDir;
+};
+
+class SourceSwitchingProjectModules : public ProjectModules {
+public:
+  SourceSwitchingProjectModules(llvm::StringRef PrimarySource,
+                                llvm::StringRef AlternateSource,
+                                const bool &UseAlternateSource)
+      : PrimarySource(PrimarySource.str()),
+        AlternateSource(AlternateSource.str()),
+        UseAlternateSource(UseAlternateSource) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    if (llvm::sys::path::filename(File) == "Use.cpp")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    if (File == PrimarySource)
+      return UseAlternateSource ? "NotM" : "M";
+    if (File == AlternateSource)
+      return UseAlternateSource ? "M" : "NotM";
+    return "";
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef) override {
+    if (ModuleName != "M")
+      return "";
+    return UseAlternateSource ? AlternateSource : PrimarySource;
+  }
+
+private:
+  std::string PrimarySource;
+  std::string AlternateSource;
+  const bool &UseAlternateSource;
+};
+
+class SourceSwitchingCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  SourceSwitchingCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setUseAlternateSource(bool Value) { UseAlternateSource = Value; }
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    llvm::SmallString<256> PrimarySource(Directory);
+    llvm::sys::path::append(PrimarySource, "M-primary.cppm");
+    llvm::SmallString<256> AlternateSource(Directory);
+    llvm::sys::path::append(AlternateSource, "M-alternate.cppm");
+    return std::make_unique<SourceSwitchingProjectModules>(
+        PrimarySource.str(), AlternateSource.str(), UseAlternateSource);
+  }
+
+private:
+  mutable bool UseAlternateSource = false;
+};
+
+class ModuleUnitFlagCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  ModuleUnitFlagCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setModuleFlagValue(int Value) { ModuleFlagValue = Value; }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+    if (llvm::sys::path::filename(File) == "M.cppm")
+      Cmd->CommandLine.push_back("-DMODULE_FLAG=" +
+                                 std::to_string(ModuleFlagValue));
+    return Cmd;
+  }
+
+private:
+  int ModuleFlagValue = 1;
+};
+
 // Add files to the working testing directory and the compilation database.
 void MockDirectoryCompilationDatabase::addFile(llvm::StringRef Path,
                                                llvm::StringRef Contents) {
@@ -434,6 +572,122 @@ export int nn = 43;
   EXPECT_TRUE(NInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
+TEST_F(PrerequisiteModulesTests, AddingImportInvalidatesReuse) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export int MValue = 43;
+  )cpp");
+
+  CDB.addFile("Use.cpp", R"cpp(
+int use() {
+  return 0;
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto UseInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  EXPECT_TRUE(UseInfo);
+
+  ParseInputs UseInput = getInputs("Use.cpp", CDB);
+  std::unique_ptr<CompilerInvocation> Invocation =
+      buildCompilerInvocation(UseInput, DiagConsumer);
+  EXPECT_TRUE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.addFile("Use.cpp", R"cpp(
+import M;
+int use() {
+  return MValue;
+}
+  )cpp");
+  UseInput = getInputs("Use.cpp", CDB);
+  Invocation = buildCompilerInvocation(UseInput, DiagConsumer);
+  EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  UseInfo = Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  EXPECT_TRUE(UseInfo);
+  EXPECT_TRUE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  HeaderSearchOptions HSOpts;
+  UseInfo->adjustHeaderSearchOptions(HSOpts);
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("M"));
+}
+
+TEST_F(PrerequisiteModulesTests, ModulesPreambleCompatibility) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+export void printA();
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+#define HAS_PREAMBLE 1
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+import A;
+void foo() {}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+  EXPECT_TRUE(isPreambleCompatible(*Preamble, Use, getFullPath("Use.cpp"), *CI));
+}
+
+TEST_F(PrerequisiteModulesTests, IncludeDrivenImportInMainAST) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+export void printA();
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+import A;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+void foo() {
+  printA();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+
+  auto AST = ParsedAST::build(getFullPath("Use.cpp"), Use, std::move(CI), {},
+                              Preamble);
+  ASSERT_TRUE(AST);
+
+  const NamedDecl &D = findDecl(*AST, "printA");
+  EXPECT_TRUE(D.isFromASTFile());
+}
+
 // An End-to-End test for modules.
 TEST_F(PrerequisiteModulesTests, ParsedASTTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
@@ -468,6 +722,171 @@ import A;
 
   const NamedDecl &D = findDecl(*AST, "printA");
   EXPECT_TRUE(D.isFromASTFile());
+}
+
+// Regression test for #100924.
+TEST_F(PrerequisiteModulesTests, NoFalseODRViolationInMultipleGMFs) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  {
+    SmallString<256> SharedHeader(TestDir);
+    llvm::sys::path::append(SharedHeader, "shared.h");
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(SharedHeader, EC);
+    ASSERT_FALSE(EC);
+    OS << R"cpp(
+template <class T>
+concept HasFoo = requires {
+  T::foo;
+};
+
+template <class T>
+struct Category {
+  static constexpr int message = T::foo;
+};
+  )cpp";
+  }
+
+  CDB.addFile("b.cppm", R"cpp(
+module;
+#include "shared.h"
+export module b;
+
+export template <class T>
+concept C = requires() {
+  Category<T>::message;
+};
+  )cpp");
+
+  CDB.addFile("c.cppm", R"cpp(
+module;
+#include "shared.h"
+
+export module c;
+import b;
+
+class B {
+public:
+  static constexpr int foo = 1;
+};
+
+export template <class T>
+  requires C<T>
+class D {};
+
+D<B> S;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("c.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  EXPECT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("c.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  EXPECT_TRUE(Preamble);
+  EXPECT_TRUE(Preamble->RequiredModules);
+  HeaderSearchOptions HSOpts;
+  Preamble->RequiredModules->adjustHeaderSearchOptions(HSOpts);
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("b"));
+
+  auto AST = ParsedAST::build(getFullPath("c.cppm"), Input, std::move(CI), {},
+                              Preamble);
+  EXPECT_TRUE(AST);
+
+  for (const auto &Diag : AST->getDiagnostics())
+    EXPECT_NE(Diag.Name, "module_odr_violation_missing_decl");
+}
+
+TEST_F(PrerequisiteModulesTests, NoFalseModuleDeclNotAtStartWithGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+inline int GMFValue = 41;
+  )cpp");
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export import :Part;
+export int usePart();
+  )cpp");
+
+  CDB.addFile("M-part.cppm", R"cpp(
+module;
+#include "gmf.hpp"
+export module M:Part;
+export int partValue();
+  )cpp");
+
+  CDB.addFile("M-impl.cpp", R"cpp(
+module;
+#include "gmf.hpp"
+module M;
+import :Part;
+int usePart() {
+  return GMFValue + partValue();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M-impl.cpp", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("M-impl.cpp"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  ASSERT_TRUE(Preamble->RequiredModules);
+
+  auto AST = ParsedAST::build(getFullPath("M-impl.cpp"), Input, std::move(CI),
+                              {}, Preamble);
+  ASSERT_TRUE(AST);
+
+  for (const auto &Diag : AST->getDiagnostics())
+    EXPECT_NE(Diag.Name, "module_decl_not_at_start");
+}
+
+TEST_F(PrerequisiteModulesTests, ModuleDeclNotAtStartStillReportedWithoutGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("Bad.cpp", R"cpp(
+int prelude = 1;
+module Bad;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("Bad.cpp", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Bad.cpp"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto AST =
+      ParsedAST::build(getFullPath("Bad.cpp"), Input, std::move(CI), {},
+                       Preamble);
+  ASSERT_TRUE(AST);
+
+  bool SawModuleDeclNotAtStart = false;
+  for (const auto &Diag : AST->getDiagnostics())
+    SawModuleDeclNotAtStart |= (Diag.Name == "module_decl_not_at_start");
+  EXPECT_TRUE(SawModuleDeclNotAtStart);
 }
 
 // An end to end test for code complete in modules
@@ -508,6 +927,159 @@ void func() {
                              Preamble.get(), Use, {});
   EXPECT_FALSE(Result.Completions.empty());
   EXPECT_EQ(Result.Completions[0].Name, "printA");
+}
+
+TEST_F(PrerequisiteModulesTests, CodeCompleteModuleDocsTest) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+/// Print A value.
+export void printA();
+  )cpp");
+
+  llvm::StringLiteral UserContents = R"cpp(
+import A;
+void func() {
+  print^
+}
+)cpp";
+
+  CDB.addFile("Use.cpp", UserContents);
+  Annotations Test(UserContents);
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  EXPECT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  EXPECT_TRUE(Preamble);
+  EXPECT_TRUE(Preamble->RequiredModules);
+
+  auto Result = codeComplete(getFullPath("Use.cpp"), Test.point(),
+                             Preamble.get(), Use, {});
+  EXPECT_FALSE(Result.Completions.empty());
+
+  const CodeCompletion *PrintA = nullptr;
+  for (const auto &Completion : Result.Completions) {
+    if (Completion.Name == "printA") {
+      PrintA = &Completion;
+      break;
+    }
+  }
+  ASSERT_TRUE(PrintA);
+  ASSERT_TRUE(PrintA->Documentation);
+  EXPECT_THAT(PrintA->Documentation->asPlainText(),
+              testing::HasSubstr("Print A value."));
+}
+
+TEST_F(PrerequisiteModulesTests, CodeCompleteModuleDocsFromPrebuiltNamedModule) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+/// Print A value.
+export void printA();
+  )cpp");
+
+  llvm::StringLiteral UserContents = R"cpp(
+import A;
+void func() {
+  print^
+}
+)cpp";
+  CDB.addFile("Use.cpp", UserContents);
+  Annotations Test(UserContents);
+
+  ModulesBuilder Builder(CDB);
+  auto BuiltModules =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(BuiltModules);
+
+  HeaderSearchOptions HSOpts(TestDir);
+  BuiltModules->adjustHeaderSearchOptions(HSOpts);
+  auto It = HSOpts.PrebuiltModuleFiles.find("A");
+  ASSERT_NE(It, HSOpts.PrebuiltModuleFiles.end());
+  ASSERT_TRUE(llvm::sys::fs::exists(It->second));
+
+  CDB.ExtraClangFlags.push_back("-fmodule-file=A=" + It->second);
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto Result = codeComplete(getFullPath("Use.cpp"), Test.point(),
+                             Preamble.get(), Use, {});
+  ASSERT_FALSE(Result.Completions.empty());
+
+  const CodeCompletion *PrintA = nullptr;
+  for (const auto &Completion : Result.Completions) {
+    if (Completion.Name == "printA") {
+      PrintA = &Completion;
+      break;
+    }
+  }
+  ASSERT_TRUE(PrintA);
+  ASSERT_TRUE(PrintA->Documentation);
+  EXPECT_THAT(PrintA->Documentation->asPlainText(),
+              testing::HasSubstr("Print A value."));
+}
+
+TEST_F(PrerequisiteModulesTests, ModuleInternalMacroNotCompletedInImporter) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+#define A_INTERNAL_MACRO 1
+export void A_INTERNAL_FN();
+  )cpp");
+
+  llvm::StringLiteral UserContents = R"cpp(
+import A;
+void func() {
+  A_INT^
+}
+)cpp";
+
+  CDB.addFile("Use.cpp", UserContents);
+  Annotations Test(UserContents);
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  EXPECT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  EXPECT_TRUE(Preamble);
+  EXPECT_TRUE(Preamble->RequiredModules);
+
+  auto Result = codeComplete(getFullPath("Use.cpp"), Test.point(),
+                             Preamble.get(), Use, {});
+  EXPECT_THAT(Result.Completions,
+              testing::Contains(testing::Field(&CodeCompletion::Name,
+                                               "A_INTERNAL_FN")));
+  EXPECT_THAT(Result.Completions,
+              testing::Not(testing::Contains(testing::Field(
+                  &CodeCompletion::Name, "A_INTERNAL_MACRO"))));
 }
 
 TEST_F(PrerequisiteModulesTests, SignatureHelpTest) {
@@ -641,7 +1213,48 @@ import M;
 
   Builder.buildPrerequisiteModulesFor(getFullPath("A.cppm"), FS);
   Builder.buildPrerequisiteModulesFor(getFullPath("B.cppm"), FS);
-  EXPECT_EQ(CDB.getGlobalScanningCount(), 1u);
+  // Lookups are keyed by module name and required source file.
+  EXPECT_EQ(CDB.getGlobalScanningCount(), 2u);
+}
+
+TEST_F(PrerequisiteModulesTests, RequiredSourceSensitiveModuleCaches) {
+  FilenameSensitiveMockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M-A.cppm", R"cpp(
+export module M;
+export int fromA = 43;
+  )cpp");
+  CDB.addFile("M-B.cppm", R"cpp(
+export module M;
+export int fromB = 44;
+  )cpp");
+
+  CDB.addFile("UseA.cpp", R"cpp(
+import M;
+int useA = fromA;
+  )cpp");
+  CDB.addFile("UseB.cpp", R"cpp(
+import M;
+int useB = fromB;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto AInfo = Builder.buildPrerequisiteModulesFor(getFullPath("UseA.cpp"), FS);
+  auto BInfo = Builder.buildPrerequisiteModulesFor(getFullPath("UseB.cpp"), FS);
+
+  EXPECT_TRUE(AInfo);
+  EXPECT_TRUE(BInfo);
+
+  HeaderSearchOptions AHSOpts(TestDir);
+  HeaderSearchOptions BHSOpts(TestDir);
+  AInfo->adjustHeaderSearchOptions(AHSOpts);
+  BInfo->adjustHeaderSearchOptions(BHSOpts);
+
+  ASSERT_TRUE(AHSOpts.PrebuiltModuleFiles.count("M"));
+  ASSERT_TRUE(BHSOpts.PrebuiltModuleFiles.count("M"));
+
+  // UseA and UseB resolve module M to different module-unit sources.
+  EXPECT_NE(AHSOpts.PrebuiltModuleFiles["M"], BHSOpts.PrebuiltModuleFiles["M"]);
 }
 
 TEST_F(PrerequisiteModulesTests, PrebuiltModuleFileTest) {
@@ -671,6 +1284,208 @@ import M;
   ModuleInfo2->adjustHeaderSearchOptions(HS2);
 
   EXPECT_EQ(HS.PrebuiltModuleFiles, HS2.PrebuiltModuleFiles);
+}
+
+TEST_F(PrerequisiteModulesTests, CacheRejectsSourceRemapWithSameModuleName) {
+  SourceSwitchingCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M-primary.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("M-alternate.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 2;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto FirstInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(FirstInfo);
+  HeaderSearchOptions FirstHS(TestDir);
+  FirstInfo->adjustHeaderSearchOptions(FirstHS);
+  ASSERT_TRUE(FirstHS.PrebuiltModuleFiles.count("M"));
+  std::string FirstModulePath = FirstHS.PrebuiltModuleFiles["M"];
+
+  CDB.setUseAlternateSource(true);
+  auto SecondInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(SecondInfo);
+  HeaderSearchOptions SecondHS(TestDir);
+  SecondInfo->adjustHeaderSearchOptions(SecondHS);
+  ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, CacheRejectsModuleUnitCompileFlagsMismatch) {
+  ModuleUnitFlagCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto FirstInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(FirstInfo);
+  HeaderSearchOptions FirstHS(TestDir);
+  FirstInfo->adjustHeaderSearchOptions(FirstHS);
+  ASSERT_TRUE(FirstHS.PrebuiltModuleFiles.count("M"));
+  std::string FirstModulePath = FirstHS.PrebuiltModuleFiles["M"];
+
+  CDB.setModuleFlagValue(2);
+  auto SecondInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(SecondInfo);
+  HeaderSearchOptions SecondHS(TestDir);
+  SecondInfo->adjustHeaderSearchOptions(SecondHS);
+  ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseRejectsCompileCommandMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=1");
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.ExtraClangFlags.pop_back();
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=2");
+  auto NewInvocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(NewInvocation);
+  EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseRejectsContextHashMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  HeaderSearchOptions HS(TestDir);
+  ModuleInfo->adjustHeaderSearchOptions(HS);
+  ASSERT_TRUE(HS.PrebuiltModuleFiles.count("M"));
+
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(HS.PrebuiltModuleFiles["M"] + ".ctxhash", EC);
+  ASSERT_FALSE(EC);
+  OS << "manually-mismatched-context-hash";
+  OS.close();
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_FALSE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, CacheRejectsCompileCommandMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=1");
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto FirstInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(FirstInfo);
+  HeaderSearchOptions FirstHS(TestDir);
+  FirstInfo->adjustHeaderSearchOptions(FirstHS);
+  ASSERT_TRUE(FirstHS.PrebuiltModuleFiles.count("M"));
+  std::string FirstModulePath = FirstHS.PrebuiltModuleFiles["M"];
+
+  CDB.ExtraClangFlags.pop_back();
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=2");
+  auto SecondInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(SecondInfo);
+  HeaderSearchOptions SecondHS(TestDir);
+  SecondInfo->adjustHeaderSearchOptions(SecondHS);
+  ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, PrebuiltRejectsCompileCommandMismatch) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=1");
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+  HeaderSearchOptions HS(TestDir);
+  ModuleInfo->adjustHeaderSearchOptions(HS);
+  ASSERT_TRUE(HS.PrebuiltModuleFiles.count("M"));
+  std::string OldPrebuiltPath = HS.PrebuiltModuleFiles["M"];
+
+  CDB.ExtraClangFlags.pop_back();
+  CDB.ExtraClangFlags.push_back("-DMODULE_FLAG=2");
+  CDB.ExtraClangFlags.push_back("-fmodule-file=M=" + OldPrebuiltPath);
+  ModulesBuilder Builder2(CDB);
+  auto ModuleInfo2 =
+      Builder2.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo2);
+  HeaderSearchOptions HS2(TestDir);
+  ModuleInfo2->adjustHeaderSearchOptions(HS2);
+  ASSERT_TRUE(HS2.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_NE(OldPrebuiltPath, HS2.PrebuiltModuleFiles["M"]);
 }
 
 } // namespace
