@@ -115,10 +115,20 @@ readModuleContextHashFile(PathRef ModuleFilePath,
 
 std::string getResolvedModuleSourceIdentity(
     PathRef ModuleUnitFileName,
+    llvm::StringRef WorkingDirectory,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  // ProjectModules may return relative paths, so resolve them the same way the
+  // module compile command would before canonicalizing.
+  llvm::SmallString<256> AbsolutePath(ModuleUnitFileName);
+  if (!WorkingDirectory.empty() &&
+      !llvm::sys::path::is_absolute(AbsolutePath)) {
+    llvm::SmallString<256> Tmp(WorkingDirectory);
+    llvm::sys::path::append(Tmp, AbsolutePath);
+    AbsolutePath = std::move(Tmp);
+  }
   llvm::SmallString<256> ResolvedPath;
-  if (!VFS || VFS->getRealPath(ModuleUnitFileName, ResolvedPath))
-    return ModuleUnitFileName.str();
+  if (!VFS || VFS->getRealPath(AbsolutePath, ResolvedPath))
+    return AbsolutePath.str().str();
   return ResolvedPath.str().str();
 }
 
@@ -130,6 +140,11 @@ getCompileCommandFingerprint(const tooling::CompileCommand &CompileCommand) {
     Hash = llvm::hash_combine(Hash, Arg);
   return std::to_string(static_cast<uint64_t>(Hash));
 }
+
+bool IsModuleFileUpToDate(PathRef ModuleFilePath,
+                          const PrerequisiteModules &RequisiteModules,
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                          const CompilerInvocation *CI);
 
 // FailedPrerequisiteModules - stands for the PrerequisiteModules which has
 // errors happened during the building process.
@@ -256,6 +271,60 @@ public:
   }
 };
 
+class StaticPrerequisiteModules : public PrerequisiteModules {
+public:
+  explicit StaticPrerequisiteModules(
+      llvm::ArrayRef<std::shared_ptr<const ModuleFile>> RequiredModules)
+      : RequiredModules(RequiredModules) {}
+
+  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {
+    for (const auto &RequiredModule : RequiredModules)
+      Options.PrebuiltModuleFiles.insert_or_assign(
+          RequiredModule->getModuleName().str(),
+          RequiredModule->getModuleFilePath().str());
+  }
+
+  bool canReuse(const CompilerInvocation &,
+                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>) const override {
+    return false;
+  }
+
+private:
+  llvm::ArrayRef<std::shared_ptr<const ModuleFile>> RequiredModules;
+};
+
+class FixedThreadsafeFS : public ThreadsafeFS {
+public:
+  explicit FixedThreadsafeFS(
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS)
+      : VFS(std::move(VFS)) {}
+
+private:
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> viewImpl() const override {
+    return VFS;
+  }
+
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS;
+};
+
+std::unique_ptr<CompilerInvocation>
+buildValidationInvocation(PathRef ModuleUnitFileName,
+                          const GlobalCompilationDatabase &CDB,
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  auto Cmd = CDB.getCompileCommand(ModuleUnitFileName);
+  if (!Cmd)
+    return nullptr;
+
+  FixedThreadsafeFS TFS(std::move(VFS));
+  ParseInputs Inputs;
+  Inputs.TFS = &TFS;
+  Inputs.CompileCommand = std::move(*Cmd);
+
+  IgnoreDiagnostics IgnoreDiags;
+  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
+  return CI;
+}
+
 // ReusablePrerequisiteModules - stands for PrerequisiteModules for which all
 // the required modules are built successfully. All the module files
 // are owned by the modules builder.
@@ -350,12 +419,13 @@ private:
         continue;
       }
 
-      if (MF->getModuleSourceIdentity() !=
-          getResolvedModuleSourceIdentity(ModuleUnitFileName, VFS))
-        return false;
-
       auto Cmd = CDB->getCompileCommand(ModuleUnitFileName);
       if (!Cmd)
+        return false;
+
+      if (MF->getModuleSourceIdentity() != getResolvedModuleSourceIdentity(
+                                             ModuleUnitFileName, Cmd->Directory,
+                                             VFS))
         return false;
 
       if (MF->getCompileCommandFingerprint() !=
@@ -363,6 +433,27 @@ private:
         return false;
     }
     return true;
+  }
+
+  bool canReuseBuiltModule(const ModuleFile &MF, size_t Index,
+                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                           ProjectModules &ProjectModules) const {
+    std::string ModuleUnitFileName =
+        ProjectModules.getSourceForModuleName(MF.getModuleName(), MainFile);
+    if (ModuleUnitFileName.empty())
+      return false;
+
+    // Revalidate source-backed BMIs against the module-unit invocation and the
+    // prerequisite prefix that existed when the BMI was originally built.
+    StaticPrerequisiteModules BuiltBeforeCurrent(
+        llvm::ArrayRef(RequiredModules).take_front(Index));
+    auto ValidationCI =
+        buildValidationInvocation(ModuleUnitFileName, *CDB, VFS);
+    if (!ValidationCI)
+      return false;
+
+    return IsModuleFileUpToDate(MF.getModuleFilePath(), BuiltBeforeCurrent, VFS,
+                                ValidationCI.get());
   }
 
   llvm::SmallVector<std::shared_ptr<const ModuleFile>, 8> RequiredModules;
@@ -441,16 +532,6 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
     return !UpToDate;
   });
   return UpToDate;
-}
-
-bool IsModuleFilesUpToDate(llvm::SmallVector<PathRef> ModuleFilePaths,
-                           const PrerequisiteModules &RequisiteModules,
-                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-                           const CompilerInvocation &CI) {
-  return llvm::all_of(
-      ModuleFilePaths, [&RequisiteModules, VFS, &CI](auto ModuleFilePath) {
-        return IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS, &CI);
-      });
 }
 
 /// Build a module file for module with `ModuleName`. The information of built
@@ -550,17 +631,25 @@ bool ReusablePrerequisiteModules::canReuse(
   if (!ProjectModules)
     return false;
 
-  if (!hasSameRequiredModules(*ProjectModules) ||
-      !hasSameModuleConfiguration(CI, VFS, *ProjectModules))
+  if (!hasSameRequiredModules(*ProjectModules))
+    return false;
+
+  if (!hasSameModuleConfiguration(CI, VFS, *ProjectModules))
     return false;
 
   if (RequiredModules.empty())
     return true;
 
-  llvm::SmallVector<llvm::StringRef> BMIPaths;
-  for (auto &MF : RequiredModules)
-    BMIPaths.push_back(MF->getModuleFilePath());
-  return IsModuleFilesUpToDate(BMIPaths, *this, VFS, CI);
+  for (size_t I = 0; I < RequiredModules.size(); ++I) {
+    const auto &MF = *RequiredModules[I];
+    if (!MF.getModuleSourceIdentity().empty() &&
+        !canReuseBuiltModule(MF, I, VFS, *ProjectModules))
+      return false;
+    if (MF.getModuleSourceIdentity().empty() &&
+        !IsModuleFileUpToDate(MF.getModuleFilePath(), *this, VFS, &CI))
+      return false;
+  }
+  return true;
 }
 
 class ModuleFileCache {
@@ -834,17 +923,21 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     if (ReqFileName.empty())
       return llvm::createStringError(llvm::formatv(
           "Don't get the module unit for module {0}", ReqModuleName));
-    std::string ReqSourceIdentity =
-        getResolvedModuleSourceIdentity(ReqFileName, TFS.view(std::nullopt));
     std::unique_ptr<CompilerInvocation> ReqCI;
+    std::string ReqSourceIdentity;
     std::string ReqCommandFingerprint;
     if (auto ReqCmd = getCDB().getCompileCommand(ReqFileName)) {
+      ReqSourceIdentity = getResolvedModuleSourceIdentity(
+          ReqFileName, ReqCmd->Directory, TFS.view(std::nullopt));
       ReqCommandFingerprint = getCompileCommandFingerprint(*ReqCmd);
       ParseInputs Inputs;
       Inputs.TFS = &TFS;
       Inputs.CompileCommand = std::move(*ReqCmd);
       IgnoreDiagnostics IgnoreDiags;
       ReqCI = buildCompilerInvocation(Inputs, IgnoreDiags);
+    } else {
+      ReqSourceIdentity =
+          getResolvedModuleSourceIdentity(ReqFileName, "", TFS.view(std::nullopt));
     }
 
     if (auto Cached = Cache.getModule(ReqModuleName, ReqFileName)) {
