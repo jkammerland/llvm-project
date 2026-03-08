@@ -574,6 +574,10 @@ static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
   // Imports inside headers included by the preamble aren't reliably reflected
   // in the patched main AST under experimental modules support. Keep the
   // preamble empty in that mode so such imports are parsed in the main AST.
+  // TODO: Benchmark first-open and incremental-edit latency before narrowing
+  // this workaround. The likely risk is on modules-enabled TUs with ordinary
+  // textual includes, where disabling preamble reuse can make repeated edits
+  // more expensive; module-heavy TUs may see little change.
   if (Inputs.ModulesManager && Bounds.Size != 0)
     return {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
   return Bounds;
