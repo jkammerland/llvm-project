@@ -271,60 +271,6 @@ public:
   }
 };
 
-class StaticPrerequisiteModules : public PrerequisiteModules {
-public:
-  explicit StaticPrerequisiteModules(
-      llvm::ArrayRef<std::shared_ptr<const ModuleFile>> RequiredModules)
-      : RequiredModules(RequiredModules) {}
-
-  void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {
-    for (const auto &RequiredModule : RequiredModules)
-      Options.PrebuiltModuleFiles.insert_or_assign(
-          RequiredModule->getModuleName().str(),
-          RequiredModule->getModuleFilePath().str());
-  }
-
-  bool canReuse(const CompilerInvocation &,
-                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>) const override {
-    return false;
-  }
-
-private:
-  llvm::ArrayRef<std::shared_ptr<const ModuleFile>> RequiredModules;
-};
-
-class FixedThreadsafeFS : public ThreadsafeFS {
-public:
-  explicit FixedThreadsafeFS(
-      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS)
-      : VFS(std::move(VFS)) {}
-
-private:
-  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> viewImpl() const override {
-    return VFS;
-  }
-
-  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS;
-};
-
-std::unique_ptr<CompilerInvocation>
-buildValidationInvocation(PathRef ModuleUnitFileName,
-                          const GlobalCompilationDatabase &CDB,
-                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
-  auto Cmd = CDB.getCompileCommand(ModuleUnitFileName);
-  if (!Cmd)
-    return nullptr;
-
-  FixedThreadsafeFS TFS(std::move(VFS));
-  ParseInputs Inputs;
-  Inputs.TFS = &TFS;
-  Inputs.CompileCommand = std::move(*Cmd);
-
-  IgnoreDiagnostics IgnoreDiags;
-  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
-  return CI;
-}
-
 // ReusablePrerequisiteModules - stands for PrerequisiteModules for which all
 // the required modules are built successfully. All the module files
 // are owned by the modules builder.
@@ -433,27 +379,6 @@ private:
         return false;
     }
     return true;
-  }
-
-  bool canReuseBuiltModule(const ModuleFile &MF, size_t Index,
-                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-                           ProjectModules &ProjectModules) const {
-    std::string ModuleUnitFileName =
-        ProjectModules.getSourceForModuleName(MF.getModuleName(), MainFile);
-    if (ModuleUnitFileName.empty())
-      return false;
-
-    // Revalidate source-backed BMIs against the module-unit invocation and the
-    // prerequisite prefix that existed when the BMI was originally built.
-    StaticPrerequisiteModules BuiltBeforeCurrent(
-        llvm::ArrayRef(RequiredModules).take_front(Index));
-    auto ValidationCI =
-        buildValidationInvocation(ModuleUnitFileName, *CDB, VFS);
-    if (!ValidationCI)
-      return false;
-
-    return IsModuleFileUpToDate(MF.getModuleFilePath(), BuiltBeforeCurrent, VFS,
-                                ValidationCI.get());
   }
 
   llvm::SmallVector<std::shared_ptr<const ModuleFile>, 8> RequiredModules;
@@ -640,16 +565,13 @@ bool ReusablePrerequisiteModules::canReuse(
   if (RequiredModules.empty())
     return true;
 
-  for (size_t I = 0; I < RequiredModules.size(); ++I) {
-    const auto &MF = *RequiredModules[I];
-    if (!MF.getModuleSourceIdentity().empty() &&
-        !canReuseBuiltModule(MF, I, VFS, *ProjectModules))
-      return false;
-    if (MF.getModuleSourceIdentity().empty() &&
-        !IsModuleFileUpToDate(MF.getModuleFilePath(), *this, VFS, &CI))
-      return false;
-  }
-  return true;
+  llvm::SmallVector<llvm::StringRef> BMIPaths;
+  for (auto &MF : RequiredModules)
+    BMIPaths.push_back(MF->getModuleFilePath());
+  return llvm::all_of(
+      BMIPaths, [this, VFS, &CI](auto ModuleFilePath) {
+        return IsModuleFileUpToDate(ModuleFilePath, *this, VFS, &CI);
+      });
 }
 
 class ModuleFileCache {

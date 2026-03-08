@@ -242,6 +242,37 @@ private:
   int ModuleFlagValue = 1;
 };
 
+class ImporterTargetCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  ImporterTargetCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setImporterTarget(llvm::StringRef Target) {
+    ImporterTarget = Target.str();
+  }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName != "M.cppm" && FileName != "U.cpp")
+      return Cmd;
+
+    Cmd->CommandLine.push_back("-target");
+    Cmd->CommandLine.push_back(FileName == "U.cpp" ? ImporterTarget
+                                                    : ModuleTarget);
+    return Cmd;
+  }
+
+private:
+  std::string ModuleTarget = "x86_64";
+  std::string ImporterTarget = "x86_64";
+};
+
 // Add files to the working testing directory and the compilation database.
 void MockDirectoryCompilationDatabase::addFile(llvm::StringRef Path,
                                                llvm::StringRef Contents) {
@@ -1449,6 +1480,48 @@ int UseM = MValue;
       buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
   ASSERT_TRUE(NewInvocation);
   EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, ImporterTargetMismatchMakesBMIUnusable) {
+  ImporterTargetCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export void takeList(__builtin_va_list);
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+void use(__builtin_va_list List) {
+  takeList(List);
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.setImporterTarget("wasm32");
+  ParseInputs Inputs = getInputs("U.cpp", CDB);
+  auto NewInvocation = buildCompilerInvocation(Inputs, DiagConsumer);
+  ASSERT_TRUE(NewInvocation);
+
+  EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+
+  applyRequiredModulesSettings(ModuleInfo.get(), *NewInvocation);
+  auto AST = ParsedAST::build(getFullPath("U.cpp"), Inputs,
+                              std::move(NewInvocation), {}, nullptr);
+  ASSERT_TRUE(AST);
+
+  bool SawError = llvm::any_of(AST->getDiagnostics(), [](const Diag &D) {
+    return D.Severity == DiagnosticsEngine::Error;
+  });
+  EXPECT_TRUE(SawError);
 }
 
 TEST_F(PrerequisiteModulesTests, CacheRejectsCompileCommandMismatch) {
