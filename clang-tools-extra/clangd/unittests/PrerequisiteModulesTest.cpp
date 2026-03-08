@@ -1418,6 +1418,39 @@ int UseM = MValue;
   EXPECT_FALSE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
+TEST_F(PrerequisiteModulesTests, ReuseRejectsSourceRemapWithSameModuleName) {
+  SourceSwitchingCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M-primary.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("M-alternate.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 2;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.setUseAlternateSource(true);
+  auto NewInvocation =
+      buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(NewInvocation);
+  EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
 TEST_F(PrerequisiteModulesTests, CacheRejectsCompileCommandMismatch) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 

@@ -310,14 +310,10 @@ public:
   }
 
 private:
-  bool hasSameRequiredModules() const {
-    auto ProjectModules = CDB->getProjectModules(MainFile);
-    if (!ProjectModules)
-      return false;
-
+  bool hasSameRequiredModules(ProjectModules &ProjectModules) const {
     llvm::StringSet<> CurrentRequiredModuleNames;
     for (llvm::StringRef ModuleName :
-         ProjectModules->getRequiredModules(MainFile))
+         ProjectModules.getRequiredModules(MainFile))
       CurrentRequiredModuleNames.insert(ModuleName);
 
     if (CurrentRequiredModuleNames.size() != DirectRequiredModuleNames.size())
@@ -325,6 +321,45 @@ private:
 
     for (llvm::StringRef ModuleName : DirectRequiredModuleNames.keys()) {
       if (!CurrentRequiredModuleNames.contains(ModuleName))
+        return false;
+    }
+    return true;
+  }
+
+  bool hasSameModuleConfiguration(
+      const CompilerInvocation &CI,
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+      ProjectModules &ProjectModules) const {
+    const auto &CurrentPrebuiltModuleFiles =
+        CI.getHeaderSearchOpts().PrebuiltModuleFiles;
+    for (const auto &MF : RequiredModules) {
+      if (auto It = CurrentPrebuiltModuleFiles.find(MF->getModuleName());
+          It != CurrentPrebuiltModuleFiles.end()) {
+        if (maybeCaseFoldPath(It->second) !=
+            maybeCaseFoldPath(MF->getModuleFilePath()))
+          return false;
+        continue;
+      }
+
+      std::string ModuleUnitFileName =
+          ProjectModules.getSourceForModuleName(MF->getModuleName(), MainFile);
+      if (ModuleUnitFileName.empty()) {
+        if (!MF->getModuleSourceIdentity().empty() ||
+            !MF->getCompileCommandFingerprint().empty())
+          return false;
+        continue;
+      }
+
+      if (MF->getModuleSourceIdentity() !=
+          getResolvedModuleSourceIdentity(ModuleUnitFileName, VFS))
+        return false;
+
+      auto Cmd = CDB->getCompileCommand(ModuleUnitFileName);
+      if (!Cmd)
+        return false;
+
+      if (MF->getCompileCommandFingerprint() !=
+          getCompileCommandFingerprint(*Cmd))
         return false;
     }
     return true;
@@ -511,7 +546,12 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
 bool ReusablePrerequisiteModules::canReuse(
     const CompilerInvocation &CI,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) const {
-  if (!hasSameRequiredModules())
+  auto ProjectModules = CDB->getProjectModules(MainFile);
+  if (!ProjectModules)
+    return false;
+
+  if (!hasSameRequiredModules(*ProjectModules) ||
+      !hasSameModuleConfiguration(CI, VFS, *ProjectModules))
     return false;
 
   if (RequiredModules.empty())
