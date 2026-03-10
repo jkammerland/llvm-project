@@ -833,9 +833,11 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     std::vector<Diag> D = ASTDiags.take(&*CTContext);
     Diags.insert(Diags.end(), D.begin(), D.end());
   }
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      Clang->getLangOpts(), llvm::MemoryBufferRef(Inputs.Contents, Filename), 0);
   const bool ModulesPreambleBypassed =
-      Inputs.ModulesManager && Preamble &&
-      Preamble->Preamble.getBounds().Size == 0;
+      Preamble && Preamble->Preamble.getBounds().Size == 0 &&
+      shouldBypassPreambleForModules(Inputs, NaturalPreambleBounds);
   ParsedAST Result(Filename, Inputs.Version, std::move(Preamble),
                    std::move(Clang), std::move(Action), std::move(Tokens),
                    std::move(Macros), std::move(Marks), std::move(ParsedDecls),

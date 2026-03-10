@@ -149,6 +149,11 @@ struct PreambleBuildStats {
   size_t SerializedSize;
 };
 
+/// Returns true when modules support intentionally forces a naturally
+/// non-empty preamble to be treated as empty.
+bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
+                                    PreambleBounds NaturalBounds);
+
 /// Build a preamble for the new inputs unless an old one can be reused.
 /// If \p PreambleCallback is set, it will be run on top of the AST while
 /// building the preamble.

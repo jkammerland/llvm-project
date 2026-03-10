@@ -578,9 +578,14 @@ static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
   // this workaround. The likely risk is on modules-enabled TUs with ordinary
   // textual includes, where disabling preamble reuse can make repeated edits
   // more expensive; module-heavy TUs may see little change.
-  if (Inputs.ModulesManager && Bounds.Size != 0)
+  if (shouldBypassPreambleForModules(Inputs, Bounds))
     return {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
   return Bounds;
+}
+
+bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
+                                    PreambleBounds NaturalBounds) {
+  return Inputs.ModulesManager && NaturalBounds.Size != 0;
 }
 
 std::shared_ptr<const PreambleData>

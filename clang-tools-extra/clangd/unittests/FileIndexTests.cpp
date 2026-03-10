@@ -490,6 +490,82 @@ export constexpr int AValue = 1;
               UnorderedElementsAre(qName("ns_in_header::func_in_header")));
 }
 
+TEST(FileIndexTest, NaturalZeroPreambleDoesNotCountAsModulesBypass) {
+  const auto Main = testPath("main.cpp");
+
+  MockFS FS;
+  const std::string MainContents = "int main_symbol();\n";
+  FS.Files[Main] = MainContents;
+
+  struct ModulesCDB : public MockCompilationDatabase {
+    explicit ModulesCDB(std::string Main) : Main(std::move(Main)) {
+      ExtraClangFlags.push_back("-std=c++20");
+      ExtraClangFlags.push_back("-c");
+    }
+
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      auto Basic = getFallbackCommand(File);
+      Basic.Heuristic.clear();
+      Basic.CommandLine.push_back("-std=c++20");
+      Basic.CommandLine.push_back("-c");
+      return Basic;
+    }
+
+    std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+      class EmptyProjectModules : public ProjectModules {
+      public:
+        std::vector<std::string> getRequiredModules(PathRef) override {
+          return {};
+        }
+
+        std::string getModuleNameForSource(PathRef) override { return ""; }
+
+        void setCommandMangler(CommandMangler) override {}
+
+        std::string getSourceForModuleName(llvm::StringRef, PathRef) override {
+          return "";
+        }
+      };
+
+      return std::make_unique<EmptyProjectModules>();
+    }
+
+    std::string Main;
+  } CDB(Main);
+
+  ParseInputs PI;
+  PI.CompileCommand = *CDB.getCompileCommand(Main);
+  PI.TFS = &FS;
+  PI.Contents = MainContents;
+
+  IgnoreDiagnostics IgnoreDiags;
+  auto CI = buildCompilerInvocation(PI, IgnoreDiags);
+  ASSERT_TRUE(CI);
+
+  ModulesBuilder Builder(CDB);
+  ParseInputs ModulesPI = PI;
+  ModulesPI.ModulesManager = &Builder;
+  auto ModulesCI = buildCompilerInvocation(ModulesPI, IgnoreDiags);
+  ASSERT_TRUE(ModulesCI);
+
+  auto Preamble = buildPreamble(
+      Main, *ModulesCI, ModulesPI,
+      /*StoreInMemory=*/true,
+      [&](CapturedASTCtx ASTCtx,
+          std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+        (void)ASTCtx;
+        (void)PI;
+      });
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+
+  auto ModulesAST =
+      ParsedAST::build(Main, ModulesPI, std::move(ModulesCI), {}, Preamble);
+  ASSERT_TRUE(ModulesAST);
+  EXPECT_FALSE(ModulesAST->bypassedPreambleForModules());
+}
+
 TEST(FileIndexTest, Refs) {
   const char *HeaderCode = "class Foo {};";
   Annotations MainCode(R"cpp(
