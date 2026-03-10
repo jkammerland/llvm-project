@@ -1088,6 +1088,51 @@ bool ModulesBuilder::ModulesBuilderImpl::getExplicitPrebuiltModuleFile(
 llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     PathRef RequiredSource, StringRef ModuleName, const ThreadsafeFS &TFS,
     CachingProjectModules &MDB, ReusablePrerequisiteModules &BuiltModuleFiles) {
+  if (BuiltModuleFiles.isModuleUnitBuilt(ModuleName)) {
+    if (auto Cmd = getCDB().getCompileCommand(RequiredSource)) {
+      auto ValidationCI =
+          buildCompilerInvocationForCommand(*Cmd, TFS.view(std::nullopt));
+      if (ValidationCI) {
+        if (auto It =
+                ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.find(
+                    ModuleName);
+            It != ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.end() &&
+            IsModuleFileUpToDate(It->second, BuiltModuleFiles,
+                                 TFS.view(std::nullopt), ValidationCI.get())) {
+          if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
+                  ModuleName, ValidationCI.get(),
+                  /*ModuleSourceIdentity=*/"",
+                  /*CompileCommandFingerprint=*/""))
+            return llvm::createStringError(llvm::formatv(
+                "Conflicting module lookup for module {0}", ModuleName));
+          BuiltModuleFiles.recordRequiredSourceForLookup(ModuleName,
+                                                         RequiredSource);
+          return llvm::Error::success();
+        }
+      }
+    }
+
+    std::string ModuleUnitFileName =
+        MDB.getSourceForModuleName(ModuleName, RequiredSource);
+    if (ModuleUnitFileName.empty())
+      return llvm::Error::success();
+
+    auto Config = getModuleLookupConfiguration(ModuleUnitFileName, getCDB(), TFS);
+    if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
+            ModuleName, Config.CI.get(), Config.SourceIdentity,
+            Config.CommandFingerprint))
+      return llvm::createStringError(llvm::formatv(
+          "Conflicting module lookup for module {0}", ModuleName));
+    BuiltModuleFiles.recordRequiredSourceForLookup(ModuleName, RequiredSource);
+    return llvm::Error::success();
+  }
+
+  if (getExplicitPrebuiltModuleFile(RequiredSource, ModuleName, TFS,
+                                    BuiltModuleFiles)) {
+    BuiltModuleFiles.recordRequiredSourceForLookup(ModuleName, RequiredSource);
+    return llvm::Error::success();
+  }
+
   std::string ModuleUnitFileName =
       MDB.getSourceForModuleName(ModuleName, RequiredSource);
   /// It is possible that we're meeting third party modules (modules whose
@@ -1100,18 +1145,6 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
   if (ModuleUnitFileName.empty())
     return llvm::createStringError(
         llvm::formatv("Don't get the module unit for module {0}", ModuleName));
-
-  if (BuiltModuleFiles.isModuleUnitBuilt(ModuleName)) {
-    auto Config =
-        getModuleLookupConfiguration(ModuleUnitFileName, getCDB(), TFS);
-    if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
-            ModuleName, Config.CI.get(), Config.SourceIdentity,
-            Config.CommandFingerprint))
-      return llvm::createStringError(llvm::formatv(
-          "Conflicting module lookup for module {0}", ModuleName));
-    BuiltModuleFiles.recordRequiredSourceForLookup(ModuleName, RequiredSource);
-    return llvm::Error::success();
-  }
 
   /// Try to get prebuilt module files from the compilation database first. This
   /// helps to avoid building the module files that are already built by the
