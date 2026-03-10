@@ -179,6 +179,33 @@ buildCompilerInvocationForCommand(const tooling::CompileCommand &Command,
   return buildCompilerInvocation(Inputs, IgnoreDiags);
 }
 
+struct ModuleLookupConfiguration {
+  std::unique_ptr<CompilerInvocation> CI;
+  std::string SourceIdentity;
+  std::string CommandFingerprint;
+};
+
+ModuleLookupConfiguration
+getModuleLookupConfiguration(PathRef ModuleUnitFileName,
+                             const GlobalCompilationDatabase &CDB,
+                             const ThreadsafeFS &TFS) {
+  ModuleLookupConfiguration Config;
+  if (auto Cmd = CDB.getCompileCommand(ModuleUnitFileName)) {
+    Config.SourceIdentity = getResolvedModuleSourceIdentity(
+        ModuleUnitFileName, Cmd->Directory, TFS.view(std::nullopt));
+    Config.CommandFingerprint = getCompileCommandFingerprint(*Cmd);
+    ParseInputs Inputs;
+    Inputs.TFS = &TFS;
+    Inputs.CompileCommand = std::move(*Cmd);
+    IgnoreDiagnostics IgnoreDiags;
+    Config.CI = buildCompilerInvocation(Inputs, IgnoreDiags);
+  } else {
+    Config.SourceIdentity =
+        getResolvedModuleSourceIdentity(ModuleUnitFileName, "", TFS.view(std::nullopt));
+  }
+  return Config;
+}
+
 void applyModuleBuildInvocationSettings(CompilerInvocation &CI) {
   // In clang's driver, we suppress ODR checks in GMF while building modules.
   // Keep reuse validation aligned with that mode.
@@ -402,6 +429,34 @@ public:
     recordRequiredSourceForLookup(MF->getModuleName(),
                                   MF->getRequiredSourceForLookup());
     RequiredModules.emplace_back(std::move(MF));
+  }
+
+public:
+  const ModuleFile *findRequiredModule(llvm::StringRef ModuleName) const {
+    auto It = llvm::find_if(RequiredModules, [&](const auto &MF) {
+      return MF->getModuleName() == ModuleName;
+    });
+    if (It == RequiredModules.end())
+      return nullptr;
+    return It->get();
+  }
+
+  bool matchesBuiltModuleConfiguration(llvm::StringRef ModuleName,
+                                       const CompilerInvocation *CI,
+                                       llvm::StringRef ModuleSourceIdentity,
+                                       llvm::StringRef CompileCommandFingerprint) const {
+    const ModuleFile *MF = findRequiredModule(ModuleName);
+    if (!MF)
+      return false;
+
+    if (CI)
+      if (auto It = CI->getHeaderSearchOpts().PrebuiltModuleFiles.find(ModuleName);
+          It != CI->getHeaderSearchOpts().PrebuiltModuleFiles.end())
+        return maybeCaseFoldPath(It->second) ==
+               maybeCaseFoldPath(MF->getModuleFilePath());
+
+    return MF->getModuleSourceIdentity() == ModuleSourceIdentity &&
+           MF->getCompileCommandFingerprint() == CompileCommandFingerprint;
   }
 
 private:
@@ -968,11 +1023,6 @@ void ModulesBuilder::ModulesBuilderImpl::getPrebuiltModuleFile(
 llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     PathRef RequiredSource, StringRef ModuleName, const ThreadsafeFS &TFS,
     CachingProjectModules &MDB, ReusablePrerequisiteModules &BuiltModuleFiles) {
-  if (BuiltModuleFiles.isModuleUnitBuilt(ModuleName)) {
-    BuiltModuleFiles.recordRequiredSourceForLookup(ModuleName, RequiredSource);
-    return llvm::Error::success();
-  }
-
   std::string ModuleUnitFileName =
       MDB.getSourceForModuleName(ModuleName, RequiredSource);
   /// It is possible that we're meeting third party modules (modules whose
@@ -985,6 +1035,18 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
   if (ModuleUnitFileName.empty())
     return llvm::createStringError(
         llvm::formatv("Don't get the module unit for module {0}", ModuleName));
+
+  if (BuiltModuleFiles.isModuleUnitBuilt(ModuleName)) {
+    auto Config =
+        getModuleLookupConfiguration(ModuleUnitFileName, getCDB(), TFS);
+    if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
+            ModuleName, Config.CI.get(), Config.SourceIdentity,
+            Config.CommandFingerprint))
+      return llvm::createStringError(llvm::formatv(
+          "Conflicting module lookup for module {0}", ModuleName));
+    BuiltModuleFiles.recordRequiredSourceForLookup(ModuleName, RequiredSource);
+    return llvm::Error::success();
+  }
 
   /// Try to get prebuilt module files from the compilation database first. This
   /// helps to avoid building the module files that are already built by the
@@ -1006,28 +1068,15 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     if (ReqFileName.empty())
       return llvm::createStringError(llvm::formatv(
           "Don't get the module unit for module {0}", ReqModuleName));
-    std::unique_ptr<CompilerInvocation> ReqCI;
-    std::string ReqSourceIdentity;
-    std::string ReqCommandFingerprint;
-    if (auto ReqCmd = getCDB().getCompileCommand(ReqFileName)) {
-      ReqSourceIdentity = getResolvedModuleSourceIdentity(
-          ReqFileName, ReqCmd->Directory, TFS.view(std::nullopt));
-      ReqCommandFingerprint = getCompileCommandFingerprint(*ReqCmd);
-      ParseInputs Inputs;
-      Inputs.TFS = &TFS;
-      Inputs.CompileCommand = std::move(*ReqCmd);
-      IgnoreDiagnostics IgnoreDiags;
-      ReqCI = buildCompilerInvocation(Inputs, IgnoreDiags);
-    } else {
-      ReqSourceIdentity =
-          getResolvedModuleSourceIdentity(ReqFileName, "", TFS.view(std::nullopt));
-    }
+    auto ReqConfig = getModuleLookupConfiguration(ReqFileName, getCDB(), TFS);
 
     if (auto Cached = Cache.getModule(ReqModuleName, ReqFileName)) {
-      if (ReqCI && Cached->getModuleSourceIdentity() == ReqSourceIdentity &&
-          Cached->getCompileCommandFingerprint() == ReqCommandFingerprint &&
+      if (ReqConfig.CI &&
+          Cached->getModuleSourceIdentity() == ReqConfig.SourceIdentity &&
+          Cached->getCompileCommandFingerprint() ==
+              ReqConfig.CommandFingerprint &&
           IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
-                               TFS.view(std::nullopt), ReqCI.get())) {
+                               TFS.view(std::nullopt), ReqConfig.CI.get())) {
         log("Reusing module {0} from {1}", ReqModuleName,
             Cached->getModuleFilePath());
         BuiltModuleFiles.recordRequiredSourceForLookup(ReqModuleName,
@@ -1038,9 +1087,21 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
       Cache.remove(ReqModuleName, ReqFileName);
     }
 
+    if (BuiltModuleFiles.isModuleUnitBuilt(ReqModuleName)) {
+      if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
+              ReqModuleName, ReqConfig.CI.get(), ReqConfig.SourceIdentity,
+              ReqConfig.CommandFingerprint))
+        return llvm::createStringError(llvm::formatv(
+            "Conflicting module lookup for module {0}", ReqModuleName));
+      BuiltModuleFiles.recordRequiredSourceForLookup(ReqModuleName,
+                                                     ReqModule.RequiredSource);
+      continue;
+    }
+
     llvm::Expected<std::shared_ptr<BuiltModuleFile>> MF =
         buildModuleFile(ReqModuleName, ReqFileName, ReqModule.RequiredSource,
-                        ReqSourceIdentity, ReqCommandFingerprint, getCDB(), TFS,
+                        ReqConfig.SourceIdentity, ReqConfig.CommandFingerprint,
+                        getCDB(), TFS,
                         BuiltModuleFiles);
     if (llvm::Error Err = MF.takeError())
       return Err;
