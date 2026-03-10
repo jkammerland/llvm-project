@@ -575,6 +575,43 @@ private:
     return true;
   }
 
+  bool hasSameDirectModuleConfiguration(
+      const CompilerInvocation &CI,
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+      ProjectModules &ProjectModules) const {
+    for (llvm::StringRef ModuleName : DirectRequiredModuleNames.keys()) {
+      const ModuleFile *MF = findRequiredModule(ModuleName);
+      if (!MF)
+        return false;
+
+      if (auto It = CI.getHeaderSearchOpts().PrebuiltModuleFiles.find(ModuleName);
+          It != CI.getHeaderSearchOpts().PrebuiltModuleFiles.end()) {
+        if (maybeCaseFoldPath(It->second) !=
+            maybeCaseFoldPath(MF->getModuleFilePath()))
+          return false;
+        continue;
+      }
+
+      std::string ModuleUnitFileName =
+          ProjectModules.getSourceForModuleName(ModuleName, MainFile);
+      if (ModuleUnitFileName.empty())
+        continue;
+
+      auto Cmd = CDB->getCompileCommand(ModuleUnitFileName);
+      if (!Cmd)
+        return false;
+
+      if (MF->getModuleSourceIdentity() != getResolvedModuleSourceIdentity(
+                                             ModuleUnitFileName,
+                                             Cmd->Directory, VFS))
+        return false;
+      if (MF->getCompileCommandFingerprint() !=
+          getCompileCommandFingerprint(*Cmd))
+        return false;
+    }
+    return true;
+  }
+
   bool canReuseSourceBackedModule(
       const ModuleFile &MF, size_t Index, const CompilerInvocation &ImporterCI,
       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
@@ -786,6 +823,12 @@ bool ReusablePrerequisiteModules::canReuse(
     return false;
 
   if (!hasSameModuleConfiguration(CI, VFS, *ProjectModules))
+    return false;
+
+  // A direct import may have been satisfied transitively when this reusable set
+  // was built. Recheck the current main-file lookup so a newly-resolved direct
+  // module mapping can't silently pin the old BMI.
+  if (!hasSameDirectModuleConfiguration(CI, VFS, *ProjectModules))
     return false;
 
   if (RequiredModules.empty())
