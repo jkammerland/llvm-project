@@ -431,68 +431,101 @@ public:
   ModuleFileCache(const GlobalCompilationDatabase &CDB) : CDB(CDB) {}
   const GlobalCompilationDatabase &getCDB() const { return CDB; }
 
-  std::shared_ptr<const ModuleFile> getModule(StringRef ModuleName);
+  std::shared_ptr<const ModuleFile> getModule(StringRef ModuleName,
+                                              PathRef ModuleUnitSourcePath);
 
-  void add(StringRef ModuleName, std::shared_ptr<const ModuleFile> ModuleFile) {
+  void add(StringRef ModuleName, PathRef ModuleUnitSourcePath,
+           std::shared_ptr<const ModuleFile> ModuleFile) {
     std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
-    ModuleFiles[ModuleName] = ModuleFile;
+    ModuleFiles[ModuleName][maybeCaseFoldPath(ModuleUnitSourcePath)] =
+        ModuleFile;
   }
 
-  void remove(StringRef ModuleName);
+  void remove(StringRef ModuleName, PathRef ModuleUnitSourcePath);
 
 private:
   const GlobalCompilationDatabase &CDB;
 
-  llvm::StringMap<std::weak_ptr<const ModuleFile>> ModuleFiles;
+  llvm::StringMap<llvm::StringMap<std::weak_ptr<const ModuleFile>>> ModuleFiles;
   // Mutex to guard accesses to ModuleFiles.
   std::mutex ModuleFilesMutex;
 };
 
 std::shared_ptr<const ModuleFile>
-ModuleFileCache::getModule(StringRef ModuleName) {
+ModuleFileCache::getModule(StringRef ModuleName, PathRef ModuleUnitSourcePath) {
   std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
-  auto Iter = ModuleFiles.find(ModuleName);
-  if (Iter == ModuleFiles.end())
+  auto It = ModuleFiles.find(ModuleName);
+  if (It == ModuleFiles.end())
     return nullptr;
 
-  if (auto Res = Iter->second.lock())
+  auto SourcePathKey = maybeCaseFoldPath(ModuleUnitSourcePath);
+  auto SourceIt = It->second.find(SourcePathKey);
+  if (SourceIt == It->second.end())
+    return nullptr;
+
+  if (auto Res = SourceIt->second.lock())
     return Res;
 
-  ModuleFiles.erase(Iter);
+  It->second.erase(SourceIt);
+  if (It->second.empty())
+    ModuleFiles.erase(It);
   return nullptr;
 }
 
-void ModuleFileCache::remove(StringRef ModuleName) {
+void ModuleFileCache::remove(StringRef ModuleName,
+                             PathRef ModuleUnitSourcePath) {
   std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
-  ModuleFiles.erase(ModuleName);
+  auto It = ModuleFiles.find(ModuleName);
+  if (It == ModuleFiles.end())
+    return;
+
+  It->second.erase(maybeCaseFoldPath(ModuleUnitSourcePath));
+  if (It->second.empty())
+    ModuleFiles.erase(It);
 }
 
 class ModuleNameToSourceCache {
 public:
-  std::string getSourceForModuleName(llvm::StringRef ModuleName) {
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) {
     std::lock_guard<std::mutex> Lock(CacheMutex);
-    auto Iter = ModuleNameToSourceCache.find(ModuleName);
-    if (Iter != ModuleNameToSourceCache.end())
-      return Iter->second;
+
+    auto It = ModuleNameToSourceCache.find(ModuleName);
+    if (It == ModuleNameToSourceCache.end())
+      return "";
+
+    auto RequiredSrcKey = maybeCaseFoldPath(RequiredSrcFile);
+    auto RequiredSrcIt = It->second.find(RequiredSrcKey);
+    if (RequiredSrcIt != It->second.end())
+      return RequiredSrcIt->second;
+
     return "";
   }
 
-  void addEntry(llvm::StringRef ModuleName, PathRef Source) {
+  void addEntry(llvm::StringRef ModuleName, PathRef RequiredSrcFile,
+                PathRef Source) {
     std::lock_guard<std::mutex> Lock(CacheMutex);
-    ModuleNameToSourceCache[ModuleName] = Source.str();
+    ModuleNameToSourceCache[ModuleName][maybeCaseFoldPath(RequiredSrcFile)] =
+        Source.str();
   }
 
-  void eraseEntry(llvm::StringRef ModuleName) {
+  void eraseEntry(llvm::StringRef ModuleName, PathRef RequiredSrcFile) {
     std::lock_guard<std::mutex> Lock(CacheMutex);
-    ModuleNameToSourceCache.erase(ModuleName);
+    auto It = ModuleNameToSourceCache.find(ModuleName);
+    if (It == ModuleNameToSourceCache.end())
+      return;
+
+    It->second.erase(maybeCaseFoldPath(RequiredSrcFile));
+    if (It->second.empty())
+      ModuleNameToSourceCache.erase(It);
   }
 
 private:
   std::mutex CacheMutex;
-  llvm::StringMap<std::string> ModuleNameToSourceCache;
+  llvm::StringMap<llvm::StringMap<std::string>> ModuleNameToSourceCache;
 };
 
 class CachingProjectModules : public ProjectModules {
@@ -514,7 +547,8 @@ public:
 
   std::string getSourceForModuleName(llvm::StringRef ModuleName,
                                      PathRef RequiredSrcFile) override {
-    std::string CachedResult = Cache.getSourceForModuleName(ModuleName);
+    std::string CachedResult =
+        Cache.getSourceForModuleName(ModuleName, RequiredSrcFile);
 
     // Verify Cached Result by seeing if the source declaring the same module
     // as we query.
@@ -525,11 +559,11 @@ public:
         return CachedResult;
 
       // Cached Result is invalid. Clear it.
-      Cache.eraseEntry(ModuleName);
+      Cache.eraseEntry(ModuleName, RequiredSrcFile);
     }
 
     auto Result = MDB->getSourceForModuleName(ModuleName, RequiredSrcFile);
-    Cache.addEntry(ModuleName, Result);
+    Cache.addEntry(ModuleName, RequiredSrcFile, Result);
 
     return Result;
   }
@@ -551,8 +585,9 @@ llvm::SmallVector<std::string> getAllRequiredModules(PathRef RequiredSource,
   auto VisitDeps = [&](StringRef ModuleName, auto Visitor) -> void {
     ModuleNamesSet.insert(ModuleName);
 
-    for (StringRef RequiredModuleName : MDB.getRequiredModules(
-             MDB.getSourceForModuleName(ModuleName, RequiredSource)))
+    std::string SourceForModule =
+        MDB.getSourceForModuleName(ModuleName, RequiredSource);
+    for (StringRef RequiredModuleName : MDB.getRequiredModules(SourceForModule))
       if (ModuleNamesSet.insert(RequiredModuleName).second)
         Visitor(RequiredModuleName, Visitor);
 
@@ -655,7 +690,13 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     if (BuiltModuleFiles.isModuleUnitBuilt(ReqModuleName))
       continue;
 
-    if (auto Cached = Cache.getModule(ReqModuleName)) {
+    std::string ReqFileName =
+        MDB.getSourceForModuleName(ReqModuleName, RequiredSource);
+    if (ReqFileName.empty())
+      return llvm::createStringError(llvm::formatv(
+          "Don't get the module unit for module {0}", ReqModuleName));
+
+    if (auto Cached = Cache.getModule(ReqModuleName, ReqFileName)) {
       if (IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
                                TFS.view(std::nullopt))) {
         log("Reusing module {0} from {1}", ReqModuleName,
@@ -663,18 +704,16 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
         BuiltModuleFiles.addModuleFile(std::move(Cached));
         continue;
       }
-      Cache.remove(ReqModuleName);
+      Cache.remove(ReqModuleName, ReqFileName);
     }
 
-    std::string ReqFileName =
-        MDB.getSourceForModuleName(ReqModuleName, RequiredSource);
     llvm::Expected<std::shared_ptr<BuiltModuleFile>> MF = buildModuleFile(
         ReqModuleName, ReqFileName, getCDB(), TFS, BuiltModuleFiles);
     if (llvm::Error Err = MF.takeError())
       return Err;
 
     log("Built module {0} to {1}", ReqModuleName, (*MF)->getModuleFilePath());
-    Cache.add(ReqModuleName, *MF);
+    Cache.add(ReqModuleName, ReqFileName, *MF);
     BuiltModuleFiles.addModuleFile(std::move(*MF));
   }
 

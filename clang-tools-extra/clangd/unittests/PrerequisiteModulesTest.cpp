@@ -104,6 +104,64 @@ private:
   mutable std::atomic<unsigned> GlobalScanningCount;
 };
 
+class FilenameSensitiveProjectModules : public ProjectModules {
+public:
+  explicit FilenameSensitiveProjectModules(PathRef TestDir)
+      : TestDir(TestDir.str()) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "UseA.cpp" || FileName == "UseB.cpp")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "M-A.cppm" || FileName == "M-B.cppm")
+      return "M";
+    return {};
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) override {
+    if (ModuleName != "M")
+      return {};
+
+    llvm::StringRef RequiredFileName =
+        llvm::sys::path::filename(RequiredSrcFile);
+    if (RequiredFileName == "UseA.cpp" || RequiredFileName == "M-A.cppm")
+      return getPathFor("M-A.cppm");
+    if (RequiredFileName == "UseB.cpp" || RequiredFileName == "M-B.cppm")
+      return getPathFor("M-B.cppm");
+    return {};
+  }
+
+private:
+  std::string getPathFor(llvm::StringRef RelativePath) const {
+    llvm::SmallString<128> FullPath(TestDir);
+    llvm::sys::path::append(FullPath, RelativePath);
+    return FullPath.str().str();
+  }
+
+  std::string TestDir;
+};
+
+class FilenameSensitiveMockDirectoryCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  FilenameSensitiveMockDirectoryCompilationDatabase(StringRef TestDir,
+                                                    const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS), TestDir(TestDir) {}
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    return std::make_unique<FilenameSensitiveProjectModules>(TestDir);
+  }
+
+private:
+  std::string TestDir;
+};
+
 // Add files to the working testing directory and the compilation database.
 void MockDirectoryCompilationDatabase::addFile(llvm::StringRef Path,
                                                llvm::StringRef Contents) {
@@ -757,7 +815,48 @@ import M;
 
   Builder.buildPrerequisiteModulesFor(getFullPath("A.cppm"), FS);
   Builder.buildPrerequisiteModulesFor(getFullPath("B.cppm"), FS);
-  EXPECT_EQ(CDB.getGlobalScanningCount(), 1u);
+  // Lookups are keyed by module name and required source file.
+  EXPECT_EQ(CDB.getGlobalScanningCount(), 2u);
+}
+
+TEST_F(PrerequisiteModulesTests, RequiredSourceSensitiveModuleCaches) {
+  FilenameSensitiveMockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M-A.cppm", R"cpp(
+export module M;
+export int fromA = 43;
+  )cpp");
+  CDB.addFile("M-B.cppm", R"cpp(
+export module M;
+export int fromB = 44;
+  )cpp");
+
+  CDB.addFile("UseA.cpp", R"cpp(
+import M;
+int useA = fromA;
+  )cpp");
+  CDB.addFile("UseB.cpp", R"cpp(
+import M;
+int useB = fromB;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto AInfo = Builder.buildPrerequisiteModulesFor(getFullPath("UseA.cpp"), FS);
+  auto BInfo = Builder.buildPrerequisiteModulesFor(getFullPath("UseB.cpp"), FS);
+
+  EXPECT_TRUE(AInfo);
+  EXPECT_TRUE(BInfo);
+
+  HeaderSearchOptions AHSOpts(TestDir);
+  HeaderSearchOptions BHSOpts(TestDir);
+  AInfo->adjustHeaderSearchOptions(AHSOpts);
+  BInfo->adjustHeaderSearchOptions(BHSOpts);
+
+  ASSERT_TRUE(AHSOpts.PrebuiltModuleFiles.count("M"));
+  ASSERT_TRUE(BHSOpts.PrebuiltModuleFiles.count("M"));
+
+  // UseA and UseB resolve module M to different module-unit sources.
+  EXPECT_NE(AHSOpts.PrebuiltModuleFiles["M"], BHSOpts.PrebuiltModuleFiles["M"]);
 }
 
 TEST_F(PrerequisiteModulesTests, PrebuiltModuleFileTest) {
