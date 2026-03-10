@@ -119,6 +119,12 @@ public:
   /// AST. Might be std::nullopt if no Preamble is used.
   std::optional<llvm::StringRef> preambleVersion() const;
 
+  /// Returns true when modules support intentionally bypassed a non-empty
+  /// preamble and this AST had to pick up header information itself.
+  bool bypassedPreambleForModules() const {
+    return ModulesPreambleBypassed;
+  }
+
   const HeuristicResolver *getHeuristicResolver() const {
     return Resolver.get();
   }
@@ -135,7 +141,8 @@ private:
             std::unique_ptr<FrontendAction> Action, syntax::TokenBuffer Tokens,
             MainFileMacros Macros, std::vector<PragmaMark> Marks,
             std::vector<Decl *> LocalTopLevelDecls, std::vector<Diag> Diags,
-            IncludeStructure Includes, include_cleaner::PragmaIncludes PI);
+            IncludeStructure Includes, include_cleaner::PragmaIncludes PI,
+            bool ModulesPreambleBypassed);
   Path TUPath;
   std::string Version;
   // In-memory preambles must outlive the AST, it is important that this member
@@ -166,6 +173,7 @@ private:
   std::vector<Decl *> LocalTopLevelDecls;
   IncludeStructure Includes;
   include_cleaner::PragmaIncludes PI;
+  bool ModulesPreambleBypassed = false;
   std::unique_ptr<HeuristicResolver> Resolver;
 };
 

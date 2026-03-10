@@ -9,6 +9,7 @@
 #include "Annotations.h"
 #include "Compiler.h"
 #include "Headers.h"
+#include "ModulesBuilder.h"
 #include "ParsedAST.h"
 #include "SyncAPI.h"
 #include "TestFS.h"
@@ -358,6 +359,135 @@ TEST(FileIndexTest, RebuildWithPreamble) {
   EXPECT_THAT(runFuzzyFind(Index, Req),
               UnorderedElementsAre(qName("ns_in_header"),
                                    qName("ns_in_header::func_in_header")));
+}
+
+TEST(FileIndexTest, ModulesEmptyPreambleStillIndexesHeaderSymbols) {
+  const auto FooCpp = testPath("foo.cpp");
+  const auto FooH = testPath("foo.h");
+  const auto Mod = testPath("A.cppm");
+
+  MockFS FS;
+  FS.Files[FooH] = R"cpp(
+    namespace ns_in_header {
+      int func_in_header();
+    }
+  )cpp";
+  FS.Files[Mod] = R"cpp(
+export module A;
+export constexpr int AValue = 1;
+  )cpp";
+
+  const std::string MainContents = R"cpp(
+    #include "foo.h"
+    import A;
+    int use() { return AValue; }
+  )cpp";
+  FS.Files[FooCpp] = MainContents;
+
+  struct ModulesCDB : public MockCompilationDatabase {
+    ModulesCDB(std::string Main, std::string Module)
+        : Main(std::move(Main)), Module(std::move(Module)) {
+      ExtraClangFlags.push_back("-std=c++20");
+      ExtraClangFlags.push_back("-c");
+    }
+
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      auto Basic = getFallbackCommand(File);
+      Basic.Heuristic.clear();
+      Basic.CommandLine.push_back("-std=c++20");
+      Basic.CommandLine.push_back("-c");
+      return Basic;
+    }
+
+    std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+      class FixedProjectModules : public ProjectModules {
+      public:
+        FixedProjectModules(std::string Main, std::string Module)
+            : Main(std::move(Main)), Module(std::move(Module)) {}
+
+        std::vector<std::string> getRequiredModules(PathRef File) override {
+          return File == Main ? std::vector<std::string>{"A"}
+                              : std::vector<std::string>{};
+        }
+
+        std::string getModuleNameForSource(PathRef File) override {
+          return File == Module ? "A" : "";
+        }
+
+        void setCommandMangler(CommandMangler) override {}
+
+        std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                           PathRef) override {
+          return ModuleName == "A" ? Module : "";
+        }
+
+      private:
+        std::string Main;
+        std::string Module;
+      };
+
+      return std::make_unique<FixedProjectModules>(Main, Module);
+    }
+
+    std::string Main;
+    std::string Module;
+  } CDB(FooCpp, Mod);
+
+  ParseInputs PI;
+  PI.CompileCommand = *CDB.getCompileCommand(FooCpp);
+  PI.TFS = &FS;
+  PI.Contents = MainContents;
+
+  IgnoreDiagnostics IgnoreDiags;
+  auto CI = buildCompilerInvocation(PI, IgnoreDiags);
+  ASSERT_TRUE(CI);
+
+  FileIndex PlainIndex(true);
+  bool PlainUpdated = false;
+  buildPreamble(
+      FooCpp, *CI, PI,
+      /*StoreInMemory=*/true,
+      [&](CapturedASTCtx ASTCtx,
+          std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+        auto &Ctx = ASTCtx.getASTContext();
+        auto &PP = ASTCtx.getPreprocessor();
+        PlainUpdated = true;
+        PlainIndex.updatePreamble(FooCpp, /*Version=*/"null", Ctx, PP, *PI);
+      });
+  ASSERT_TRUE(PlainUpdated);
+
+  ModulesBuilder Builder(CDB);
+  ParseInputs ModulesPI = PI;
+  ModulesPI.ModulesManager = &Builder;
+  auto ModulesCI = buildCompilerInvocation(ModulesPI, IgnoreDiags);
+  ASSERT_TRUE(ModulesCI);
+
+  FileIndex ModulesIndex(true);
+  auto Preamble = buildPreamble(
+      FooCpp, *ModulesCI, ModulesPI,
+      /*StoreInMemory=*/true,
+      [&](CapturedASTCtx ASTCtx,
+          std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+        (void)ASTCtx;
+        (void)PI;
+      });
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+
+  auto ModulesAST =
+      ParsedAST::build(FooCpp, ModulesPI, std::move(ModulesCI), {}, Preamble);
+  ASSERT_TRUE(ModulesAST);
+  ModulesIndex.updateMain(FooCpp, *ModulesAST);
+
+  FuzzyFindRequest Req;
+  Req.Query = "func_in_header";
+  Req.Scopes = {"ns_in_header::"};
+
+  EXPECT_THAT(runFuzzyFind(PlainIndex, Req),
+              UnorderedElementsAre(qName("ns_in_header::func_in_header")));
+  EXPECT_THAT(runFuzzyFind(ModulesIndex, Req),
+              UnorderedElementsAre(qName("ns_in_header::func_in_header")));
 }
 
 TEST(FileIndexTest, Refs) {
