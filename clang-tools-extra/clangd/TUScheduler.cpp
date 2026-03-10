@@ -673,7 +673,8 @@ private:
   /// cached one if applicable. Assumes LatestPreamble is compatible for \p
   /// Inputs.
   void generateDiagnostics(std::unique_ptr<CompilerInvocation> Invocation,
-                           ParseInputs Inputs, std::vector<Diag> CIDiags);
+                           ParseInputs Inputs, std::vector<Diag> CIDiags,
+                           bool PublishDiagnostics = true);
 
   void updateASTSignals(ParsedAST &AST);
 
@@ -1131,8 +1132,14 @@ void ASTWorker::updatePreamble(std::unique_ptr<CompilerInvocation> CI,
     // Give up our ownership to old preamble before starting expensive AST
     // build.
     Preamble.reset();
-    // We only need to build the AST if diagnostics were requested.
-    if (WantDiags == WantDiagnostics::No)
+    const bool NeedsModulesMetadataRecovery =
+        WantDiags == WantDiagnostics::No && FileInputs.ModulesManager &&
+        isReliable(FileInputs.CompileCommand) && LatestPreamble &&
+        (*LatestPreamble)->Preamble.getBounds().Size == 0;
+    // We only need to build the AST if diagnostics were requested, or if
+    // modules mode intentionally bypassed the preamble and we still need the
+    // main AST to recover includer-cache and header-index metadata.
+    if (WantDiags == WantDiagnostics::No && !NeedsModulesMetadataRecovery)
       return;
     // Since the file may have been edited since we started building this
     // preamble, we use the current contents of the file instead. This provides
@@ -1144,7 +1151,9 @@ void ASTWorker::updatePreamble(std::unique_ptr<CompilerInvocation> CI,
     // Report diagnostics with the new preamble to ensure progress. Otherwise
     // diagnostics might get stale indefinitely if user keeps invalidating the
     // preamble.
-    generateDiagnostics(std::move(CI), FileInputs, std::move(CIDiags));
+    generateDiagnostics(std::move(CI), FileInputs, std::move(CIDiags),
+                        /*PublishDiagnostics=*/WantDiags !=
+                            WantDiagnostics::No);
   };
   if (RunSync) {
     runTask(TaskName, Task);
@@ -1173,7 +1182,7 @@ void ASTWorker::updateASTSignals(ParsedAST &AST) {
 
 void ASTWorker::generateDiagnostics(
     std::unique_ptr<CompilerInvocation> Invocation, ParseInputs Inputs,
-    std::vector<Diag> CIDiags) {
+    std::vector<Diag> CIDiags, bool PublishDiagnostics) {
   // Tracks ast cache accesses for publishing diags.
   static constexpr trace::Metric ASTAccessForDiag(
       "ast_access_diag", trace::Metric::Counter, "result");
@@ -1246,6 +1255,7 @@ void ASTWorker::generateDiagnostics(
     if (CanPublishResults)
       Publish();
   };
+  auto SuppressPublish = [](llvm::function_ref<void()>) {};
   if (*AST) {
     if (InputsAreLatest && Inputs.ModulesManager &&
         isReliable(Inputs.CompileCommand) &&
@@ -1253,14 +1263,18 @@ void ASTWorker::generateDiagnostics(
       HeaderIncluders.update(FileName, (**AST).getIncludeStructure().allHeaders());
     }
     trace::Span Span("Running main AST callback");
-    Callbacks.onMainAST(FileName, **AST, RunPublish);
+    if (PublishDiagnostics)
+      Callbacks.onMainAST(FileName, **AST, RunPublish);
+    else
+      Callbacks.onMainAST(FileName, **AST, SuppressPublish);
     updateASTSignals(**AST);
   } else {
     // Failed to build the AST, at least report diagnostics from the
     // command line if there were any.
     // FIXME: we might have got more errors while trying to build the
     // AST, surface them too.
-    Callbacks.onFailedAST(FileName, Inputs.Version, CIDiags, RunPublish);
+    if (PublishDiagnostics)
+      Callbacks.onFailedAST(FileName, Inputs.Version, CIDiags, RunPublish);
   }
 
   // AST might've been built for an older version of the source, as ASTWorker
