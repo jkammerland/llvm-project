@@ -2102,6 +2102,56 @@ int useX = XValue;
   EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
+TEST_F(PrerequisiteModulesTests, BuildRejectsDiamondSourceConflict) {
+  DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase CDB(TestDir,
+                                                                    FS);
+
+  CDB.addFile("M-A.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 43;
+  )cpp");
+
+  CDB.addFile("M-B.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 99;
+  )cpp");
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+import M;
+export constexpr int AValue = MValue;
+  )cpp");
+
+  CDB.addFile("B.cppm", R"cpp(
+export module B;
+import M;
+export constexpr int BValue = MValue;
+  )cpp");
+
+  CDB.addFile("X.cppm", R"cpp(
+export module X;
+import A;
+import B;
+export constexpr int XValue = AValue + BValue;
+  )cpp");
+
+  CDB.addFile("Use.cpp", R"cpp(
+import X;
+int useX = XValue;
+  )cpp");
+
+  CDB.setRemapMFromB(true);
+
+  ModulesBuilder Builder(CDB);
+  auto UseInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(UseInfo);
+
+  HeaderSearchOptions HSOpts(TestDir);
+  UseInfo->adjustHeaderSearchOptions(HSOpts);
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.empty());
+}
+
 TEST_F(PrerequisiteModulesTests, PrebuiltModuleFileTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
