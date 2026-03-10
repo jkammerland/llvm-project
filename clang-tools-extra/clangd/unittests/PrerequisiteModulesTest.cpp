@@ -232,6 +232,68 @@ private:
   mutable bool ResolveMFromUse = true;
 };
 
+class DirectMissingTransitiveProjectModules : public ProjectModules {
+public:
+  explicit DirectMissingTransitiveProjectModules(PathRef TestDir)
+      : TestDir(TestDir.str()) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "Use.cpp")
+      return {"A", "M"};
+    if (FileName == "A.cppm")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "A.cppm")
+      return "A";
+    if (FileName == "M.cppm")
+      return "M";
+    return {};
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) override {
+    if (ModuleName == "A")
+      return getPathFor("A.cppm");
+    if (ModuleName != "M")
+      return {};
+
+    llvm::StringRef RequiredFileName =
+        llvm::sys::path::filename(RequiredSrcFile);
+    if (RequiredFileName == "A.cppm")
+      return getPathFor("M.cppm");
+    return {};
+  }
+
+private:
+  std::string getPathFor(llvm::StringRef RelativePath) const {
+    llvm::SmallString<128> FullPath(TestDir);
+    llvm::sys::path::append(FullPath, RelativePath);
+    return FullPath.str().str();
+  }
+
+  std::string TestDir;
+};
+
+class DirectMissingTransitiveCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  DirectMissingTransitiveCompilationDatabase(StringRef TestDir,
+                                             const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS), TestDir(TestDir) {}
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    return std::make_unique<DirectMissingTransitiveProjectModules>(TestDir);
+  }
+
+private:
+  std::string TestDir;
+};
+
 class MixedLookupFilenameSensitiveProjectModules : public ProjectModules {
 public:
   MixedLookupFilenameSensitiveProjectModules(PathRef TestDir,
@@ -1933,6 +1995,39 @@ int useA = AValue;
       buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
   ASSERT_TRUE(Invocation);
   EXPECT_TRUE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests,
+       BuildAcceptsDirectImportSatisfiedTransitively) {
+  DirectMissingTransitiveCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 43;
+  )cpp");
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+import M;
+export constexpr int AValue = MValue;
+  )cpp");
+
+  CDB.addFile("Use.cpp", R"cpp(
+import A;
+import M;
+int useA = AValue;
+int useM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto UseInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(UseInfo);
+
+  HeaderSearchOptions HSOpts(TestDir);
+  UseInfo->adjustHeaderSearchOptions(HSOpts);
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("A"));
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("M"));
 }
 
 TEST_F(PrerequisiteModulesTests,
