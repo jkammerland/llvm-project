@@ -1132,13 +1132,17 @@ void ASTWorker::updatePreamble(std::unique_ptr<CompilerInvocation> CI,
     // Give up our ownership to old preamble before starting expensive AST
     // build.
     Preamble.reset();
+    const auto NaturalPreambleBounds = ComputePreambleBounds(
+        CI->getLangOpts(), llvm::MemoryBufferRef(FileInputs.Contents, FileName),
+        0);
     const bool NeedsModulesMetadataRecovery =
-        WantDiags == WantDiagnostics::No && FileInputs.ModulesManager &&
-        isReliable(FileInputs.CompileCommand) && LatestPreamble &&
-        (*LatestPreamble)->Preamble.getBounds().Size == 0;
+        WantDiags == WantDiagnostics::No && LatestPreamble &&
+        (*LatestPreamble)->Preamble.getBounds().Size == 0 &&
+        shouldBypassPreambleForModules(FileInputs, NaturalPreambleBounds);
     // We only need to build the AST if diagnostics were requested, or if
     // modules mode intentionally bypassed the preamble and we still need the
-    // main AST to recover includer-cache and header-index metadata.
+    // main AST to recover dynamic-index metadata (and includer-cache metadata
+    // when the compile command is reliable).
     if (WantDiags == WantDiagnostics::No && !NeedsModulesMetadataRecovery)
       return;
     // Since the file may have been edited since we started building this
