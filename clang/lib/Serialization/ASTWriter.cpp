@@ -3523,10 +3523,10 @@ void ASTWriter::WriteComments(ASTContext &Context) {
   if (!PP->getPreprocessorOpts().WriteCommentListToPCH)
     return;
 
-  // Don't write comments to BMI to reduce the size of BMI.
-  // If language services (e.g., clangd) want such abilities,
-  // we can offer a special option then.
-  if (isWritingStdCXXNamedModules())
+  // Don't write comments to named-module BMIs by default to reduce size.
+  // Language services can opt in via preprocessor options.
+  if (isWritingStdCXXNamedModules() &&
+      !PP->getPreprocessorOpts().WriteCommentListToNamedModules)
     return;
 
   RecordData Record;
