@@ -848,20 +848,13 @@ public:
 
   std::string getSourceForModuleName(llvm::StringRef ModuleName,
                                      PathRef RequiredSrcFile) override {
-    std::string CachedResult =
-        Cache.getSourceForModuleName(ModuleName, RequiredSrcFile);
-
-    // Verify Cached Result by seeing if the source declaring the same module
-    // as we query.
-    if (!CachedResult.empty()) {
-      std::string ModuleNameOfCachedSource =
-          MDB->getModuleNameForSource(CachedResult);
-      if (ModuleNameOfCachedSource == ModuleName)
+    auto &RefreshedRequiredSources = RefreshedLookupContexts[ModuleName];
+    std::string RequiredSrcKey = maybeCaseFoldPath(RequiredSrcFile);
+    if (!RefreshedRequiredSources.insert(RequiredSrcKey).second)
+      if (std::string CachedResult =
+              Cache.getSourceForModuleName(ModuleName, RequiredSrcFile);
+          !CachedResult.empty())
         return CachedResult;
-
-      // Cached Result is invalid. Clear it.
-      Cache.eraseEntry(ModuleName, RequiredSrcFile);
-    }
 
     auto Result = MDB->getSourceForModuleName(ModuleName, RequiredSrcFile);
     Cache.addEntry(ModuleName, RequiredSrcFile, Result);
@@ -872,6 +865,7 @@ public:
 private:
   std::unique_ptr<ProjectModules> MDB;
   ModuleNameToSourceCache &Cache;
+  llvm::StringMap<llvm::StringSet<>> RefreshedLookupContexts;
 };
 
 struct RequiredModuleDesc {
