@@ -502,6 +502,52 @@ private:
   std::string ImporterTarget = "x86_64";
 };
 
+class OutputPathCompilationDatabase : public MockDirectoryCompilationDatabase {
+public:
+  OutputPathCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setModuleOutput(llvm::StringRef Output) { ModuleOutput = Output.str(); }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+    if (llvm::sys::path::filename(File) == "M.cppm")
+      Cmd->Output = ModuleOutput;
+    return Cmd;
+  }
+
+private:
+  std::string ModuleOutput = "module-output-a.pcm";
+};
+
+class OutputArgCompilationDatabase : public MockDirectoryCompilationDatabase {
+public:
+  OutputArgCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setModuleOutputArg(llvm::StringRef Output) {
+    ModuleOutputArg = Output.str();
+  }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+    if (llvm::sys::path::filename(File) == "M.cppm") {
+      Cmd->CommandLine.push_back("-o");
+      Cmd->CommandLine.push_back(ModuleOutputArg);
+    }
+    return Cmd;
+  }
+
+private:
+  std::string ModuleOutputArg = "module-output-a.pcm";
+};
+
 // Add files to the working testing directory and the compilation database.
 void MockDirectoryCompilationDatabase::addFile(llvm::StringRef Path,
                                                llvm::StringRef Contents) {
@@ -2034,6 +2080,64 @@ int UseM = MValue;
   ASSERT_TRUE(SecondHS.PrebuiltModuleFiles.count("M"));
 
   EXPECT_NE(FirstModulePath, SecondHS.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseIgnoresModuleUnitOutputField) {
+  OutputPathCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.setModuleOutput("module-output-b.pcm");
+  auto NewInvocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(NewInvocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseIgnoresModuleUnitOutputArg) {
+  OutputArgCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.setModuleOutputArg("module-output-b.pcm");
+  auto NewInvocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(NewInvocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
 }
 
 TEST_F(PrerequisiteModulesTests, PrebuiltRejectsCompileCommandMismatch) {

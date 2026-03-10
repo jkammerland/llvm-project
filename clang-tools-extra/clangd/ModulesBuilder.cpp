@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ModulesBuilder.h"
+#include "CompileCommands.h"
 #include "Compiler.h"
 #include "support/Logger.h"
 #include "clang/Frontend/FrontendAction.h"
@@ -134,9 +135,20 @@ std::string getResolvedModuleSourceIdentity(
 
 std::string
 getCompileCommandFingerprint(const tooling::CompileCommand &CompileCommand) {
-  llvm::hash_code Hash = llvm::hash_combine(
-      CompileCommand.Directory, CompileCommand.Filename, CompileCommand.Output);
-  for (const auto &Arg : CompileCommand.CommandLine)
+  std::vector<std::string> CommandLine = CompileCommand.CommandLine;
+  static const auto *StripOutputArgs = [] {
+    auto *Stripper = new ArgStripper();
+    // clangd rewrites module output locations, so output-path-only changes
+    // should not invalidate reusable BMI fingerprints.
+    Stripper->strip("-o");
+    Stripper->strip("/Fo");
+    return Stripper;
+  }();
+  StripOutputArgs->process(CommandLine);
+
+  llvm::hash_code Hash =
+      llvm::hash_combine(CompileCommand.Directory, CompileCommand.Filename);
+  for (const auto &Arg : CommandLine)
     Hash = llvm::hash_combine(Hash, Arg);
   return std::to_string(static_cast<uint64_t>(Hash));
 }
