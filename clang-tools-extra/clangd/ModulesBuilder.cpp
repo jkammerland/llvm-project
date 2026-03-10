@@ -1001,6 +1001,12 @@ private:
   void getPrebuiltModuleFile(StringRef ModuleName, PathRef ModuleUnitFileName,
                              const ThreadsafeFS &TFS,
                              ReusablePrerequisiteModules &BuiltModuleFiles);
+  /// Try to reuse an explicitly configured prebuilt module mapping from the
+  /// requiring source's compile command.
+  bool getExplicitPrebuiltModuleFile(PathRef RequiredSource,
+                                     StringRef ModuleName,
+                                     const ThreadsafeFS &TFS,
+                                     ReusablePrerequisiteModules &BuiltModuleFiles);
 
   ModuleFileCache Cache;
   ModuleNameToSourceCache ProjectModulesCache;
@@ -1045,6 +1051,40 @@ void ModulesBuilder::ModulesBuilderImpl::getPrebuiltModuleFile(
   }
 }
 
+bool ModulesBuilder::ModulesBuilderImpl::getExplicitPrebuiltModuleFile(
+    PathRef RequiredSource, StringRef ModuleName, const ThreadsafeFS &TFS,
+    ReusablePrerequisiteModules &BuiltModuleFiles) {
+  auto Cmd = getCDB().getCompileCommand(RequiredSource);
+  if (!Cmd)
+    return false;
+
+  ParseInputs Inputs;
+  Inputs.TFS = &TFS;
+  Inputs.CompileCommand = std::move(*Cmd);
+
+  IgnoreDiagnostics IgnoreDiags;
+  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
+  if (!CI)
+    return false;
+
+  auto It = CI->getHeaderSearchOpts().PrebuiltModuleFiles.find(ModuleName);
+  if (It == CI->getHeaderSearchOpts().PrebuiltModuleFiles.end())
+    return false;
+
+  if (!IsModuleFileUpToDate(It->second, BuiltModuleFiles,
+                            TFS.view(std::nullopt), CI.get()))
+    return false;
+
+  log("Reusing explicit prebuilt module file {0} of module {1} for {2}",
+      It->second, ModuleName, RequiredSource);
+  BuiltModuleFiles.addModuleFile(PrebuiltModuleFile::make(
+      ModuleName, It->second,
+      /*ModuleSourceIdentity=*/"",
+      /*CompileCommandHash=*/"",
+      /*RequiredSourceForLookup=*/RequiredSource));
+  return true;
+}
+
 llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
     PathRef RequiredSource, StringRef ModuleName, const ThreadsafeFS &TFS,
     CachingProjectModules &MDB, ReusablePrerequisiteModules &BuiltModuleFiles) {
@@ -1083,6 +1123,13 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
   for (const auto &ReqModule : ReqModules) {
     llvm::StringRef ReqModuleName = ReqModule.Name;
     if (BuiltModuleFiles.isModuleUnitBuilt(ReqModuleName)) {
+      BuiltModuleFiles.recordRequiredSourceForLookup(ReqModuleName,
+                                                     ReqModule.RequiredSource);
+      continue;
+    }
+
+    if (getExplicitPrebuiltModuleFile(ReqModule.RequiredSource, ReqModuleName,
+                                      TFS, BuiltModuleFiles)) {
       BuiltModuleFiles.recordRequiredSourceForLookup(ReqModuleName,
                                                      ReqModule.RequiredSource);
       continue;
