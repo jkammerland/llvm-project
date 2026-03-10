@@ -41,6 +41,7 @@ using ::testing::Contains;
 using ::testing::ElementsAre;
 using ::testing::Gt;
 using ::testing::IsEmpty;
+using ::testing::Not;
 using ::testing::Pair;
 using ::testing::UnorderedElementsAre;
 
@@ -564,6 +565,147 @@ TEST(FileIndexTest, NaturalZeroPreambleDoesNotCountAsModulesBypass) {
       ParsedAST::build(Main, ModulesPI, std::move(ModulesCI), {}, Preamble);
   ASSERT_TRUE(ModulesAST);
   EXPECT_FALSE(ModulesAST->bypassedPreambleForModules());
+}
+
+TEST(FileIndexTest, ModulesBypassRecoveryDoesNotLeaveStaleMainSymbols) {
+  const auto Main = testPath("main.cpp");
+  const auto Header = testPath("foo.h");
+  const auto Mod = testPath("A.cppm");
+
+  MockFS FS;
+  FS.Files[Header] = R"cpp(
+    namespace ns_in_header {
+      int func_in_header();
+    }
+  )cpp";
+  FS.Files[Mod] = R"cpp(
+export module A;
+export constexpr int AValue = 1;
+  )cpp";
+
+  struct ModulesCDB : public MockCompilationDatabase {
+    ModulesCDB(std::string Main, std::string Module)
+        : Main(std::move(Main)), Module(std::move(Module)) {
+      ExtraClangFlags.push_back("-std=c++20");
+      ExtraClangFlags.push_back("-c");
+    }
+
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      auto Basic = getFallbackCommand(File);
+      Basic.Heuristic.clear();
+      Basic.CommandLine.push_back("-std=c++20");
+      Basic.CommandLine.push_back("-c");
+      return Basic;
+    }
+
+    std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+      class FixedProjectModules : public ProjectModules {
+      public:
+        FixedProjectModules(std::string Main, std::string Module)
+            : Main(std::move(Main)), Module(std::move(Module)) {}
+
+        std::vector<std::string> getRequiredModules(PathRef File) override {
+          return File == Main ? std::vector<std::string>{"A"}
+                              : std::vector<std::string>{};
+        }
+
+        std::string getModuleNameForSource(PathRef File) override {
+          return File == Module ? "A" : "";
+        }
+
+        void setCommandMangler(CommandMangler) override {}
+
+        std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                           PathRef) override {
+          return ModuleName == "A" ? Module : "";
+        }
+
+      private:
+        std::string Main;
+        std::string Module;
+      };
+
+      return std::make_unique<FixedProjectModules>(Main, Module);
+    }
+
+    std::string Main;
+    std::string Module;
+  } CDB(Main, Mod);
+
+  FileIndex Index(true);
+  IgnoreDiagnostics IgnoreDiags;
+
+  const std::string ModulesContents = R"cpp(
+    #include "foo.h"
+    import A;
+    int stale_main_symbol = AValue;
+  )cpp";
+  FS.Files[Main] = ModulesContents;
+
+  ParseInputs ModulesPI;
+  ModulesPI.CompileCommand = *CDB.getCompileCommand(Main);
+  ModulesPI.TFS = &FS;
+  ModulesPI.Contents = ModulesContents;
+
+  ModulesBuilder Builder(CDB);
+  ModulesPI.ModulesManager = &Builder;
+  auto ModulesCI = buildCompilerInvocation(ModulesPI, IgnoreDiags);
+  ASSERT_TRUE(ModulesCI);
+
+  auto ModulesPreamble = buildPreamble(
+      Main, *ModulesCI, ModulesPI,
+      /*StoreInMemory=*/true,
+      [&](CapturedASTCtx ASTCtx,
+          std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+        (void)ASTCtx;
+        (void)PI;
+      });
+  ASSERT_TRUE(ModulesPreamble);
+  EXPECT_EQ(ModulesPreamble->Preamble.getBounds().Size, 0u);
+
+  auto ModulesAST = ParsedAST::build(Main, ModulesPI, std::move(ModulesCI), {},
+                                     ModulesPreamble);
+  ASSERT_TRUE(ModulesAST);
+  ASSERT_TRUE(ModulesAST->bypassedPreambleForModules());
+  Index.updateMain(Main, *ModulesAST);
+
+  const std::string PlainContents = R"cpp(
+    #include "foo.h"
+    int fresh_main_symbol = 1;
+  )cpp";
+  FS.Files[Main] = PlainContents;
+
+  ParseInputs PlainPI;
+  PlainPI.CompileCommand = *CDB.getCompileCommand(Main);
+  PlainPI.TFS = &FS;
+  PlainPI.Contents = PlainContents;
+  auto PlainCI = buildCompilerInvocation(PlainPI, IgnoreDiags);
+  ASSERT_TRUE(PlainCI);
+
+  bool PlainPreambleUpdated = false;
+  auto PlainPreamble = buildPreamble(
+      Main, *PlainCI, PlainPI,
+      /*StoreInMemory=*/true,
+      [&](CapturedASTCtx ASTCtx,
+          std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+        PlainPreambleUpdated = true;
+        Index.updatePreamble(Main, /*Version=*/"plain", ASTCtx.getASTContext(),
+                             ASTCtx.getPreprocessor(), *PI);
+      });
+  ASSERT_TRUE(PlainPreamble);
+  ASSERT_TRUE(PlainPreambleUpdated);
+  EXPECT_GT(PlainPreamble->Preamble.getBounds().Size, 0u);
+
+  auto PlainAST =
+      ParsedAST::build(Main, PlainPI, std::move(PlainCI), {}, PlainPreamble);
+  ASSERT_TRUE(PlainAST);
+  EXPECT_FALSE(PlainAST->bypassedPreambleForModules());
+  Index.updateMain(Main, *PlainAST);
+
+  auto Symbols = runFuzzyFind(Index, "");
+  EXPECT_THAT(Symbols, Contains(qName("ns_in_header::func_in_header")));
+  EXPECT_THAT(Symbols, Not(Contains(qName("stale_main_symbol"))));
 }
 
 TEST(FileIndexTest, Refs) {
