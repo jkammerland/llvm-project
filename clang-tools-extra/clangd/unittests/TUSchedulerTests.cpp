@@ -1763,6 +1763,120 @@ export constexpr int AValue = 1;
               UnorderedElementsAre("ns_in_header::func_in_header"));
 }
 
+TEST_F(TUSchedulerTests,
+       ModulesEmptyPreambleNeedsASTForHeaderSymbolRecoveryWithHeuristicCommand) {
+  const std::string Main = testPath("main.cpp");
+  const std::string Header = testPath("foo.h");
+  const std::string Module = testPath("A.cppm");
+
+  struct ModulesCDB : public MockCompilationDatabase {
+    ModulesCDB(std::string Main, std::string Module)
+        : Main(std::move(Main)), Module(std::move(Module)) {
+      ExtraClangFlags.push_back("-std=c++20");
+      ExtraClangFlags.push_back("-c");
+    }
+
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      auto Basic = getFallbackCommand(File);
+      Basic.Heuristic = "inferred";
+      Basic.CommandLine.push_back("-std=c++20");
+      Basic.CommandLine.push_back("-c");
+      return Basic;
+    }
+
+    std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+      class FixedProjectModules : public ProjectModules {
+      public:
+        FixedProjectModules(std::string Main, std::string Module)
+            : Main(std::move(Main)), Module(std::move(Module)) {}
+
+        std::vector<std::string> getRequiredModules(PathRef File) override {
+          return File == Main ? std::vector<std::string>{"A"}
+                              : std::vector<std::string>{};
+        }
+
+        std::string getModuleNameForSource(PathRef File) override {
+          return File == Module ? "A" : "";
+        }
+
+        void setCommandMangler(CommandMangler) override {}
+
+        std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                           PathRef) override {
+          return ModuleName == "A" ? Module : "";
+        }
+
+      private:
+        std::string Main;
+        std::string Module;
+      };
+
+      return std::make_unique<FixedProjectModules>(Main, Module);
+    }
+
+    std::string Main;
+    std::string Module;
+  } CDB(Main, Module);
+
+  class IndexCallbacks : public ParsingCallbacks {
+  public:
+    void onPreambleAST(
+        PathRef Path, llvm::StringRef Version, CapturedASTCtx ASTCtx,
+        std::shared_ptr<const include_cleaner::PragmaIncludes> PI) override {
+      Index.updatePreamble(Path, Version, ASTCtx.getASTContext(),
+                           ASTCtx.getPreprocessor(), *PI);
+    }
+
+    void onMainAST(PathRef Path, ParsedAST &AST, PublishFn) override {
+      SawMainAST = true;
+      Index.updateMain(Path, AST);
+    }
+
+    FileIndex Index{true};
+    bool SawMainAST = false;
+  };
+
+  auto Callbacks = std::make_unique<IndexCallbacks>();
+  auto *CallbacksPtr = Callbacks.get();
+  ModulesBuilder Builder(CDB);
+  TUScheduler WithModules(CDB, optsForTest(), std::move(Callbacks));
+
+  FS.Files[Header] = R"cpp(
+    namespace ns_in_header {
+      int func_in_header();
+    }
+  )cpp";
+  FS.Files[Module] = R"cpp(
+export module A;
+export constexpr int AValue = 1;
+  )cpp";
+
+  const char *MainContents = R"cpp(
+    #include "foo.h"
+    import A;
+    int use() { return AValue; }
+  )cpp";
+  FS.Files[Main] = MainContents;
+
+  ParseInputs ModulesInputs;
+  ModulesInputs.CompileCommand = *CDB.getCompileCommand(Main);
+  ModulesInputs.TFS = &FS;
+  ModulesInputs.Contents = MainContents;
+  ModulesInputs.Opts = ParseOptions();
+  ASSERT_FALSE(ModulesInputs.CompileCommand.Heuristic.empty());
+  ModulesInputs.ModulesManager = &Builder;
+  WithModules.update(Main, std::move(ModulesInputs), WantDiagnostics::No);
+  ASSERT_TRUE(WithModules.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_TRUE(CallbacksPtr->SawMainAST);
+
+  FuzzyFindRequest Req;
+  Req.Query = "func_in_header";
+  Req.Scopes = {"ns_in_header::"};
+  EXPECT_THAT(match(CallbacksPtr->Index, Req),
+              UnorderedElementsAre("ns_in_header::func_in_header"));
+}
+
 TEST_F(TUSchedulerTests, PreservesLastActiveFile) {
   for (bool Sync : {false, true}) {
     auto Opts = optsForTest();
