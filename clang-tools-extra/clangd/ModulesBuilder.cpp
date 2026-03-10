@@ -141,10 +141,49 @@ getCompileCommandFingerprint(const tooling::CompileCommand &CompileCommand) {
   return std::to_string(static_cast<uint64_t>(Hash));
 }
 
+class SingleViewThreadsafeFS : public ThreadsafeFS {
+public:
+  explicit SingleViewThreadsafeFS(
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS)
+      : FS(std::move(FS)) {}
+
+private:
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> viewImpl() const override {
+    return FS;
+  }
+
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS;
+};
+
+std::unique_ptr<CompilerInvocation>
+buildCompilerInvocationForCommand(const tooling::CompileCommand &Command,
+                                  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>
+                                      VFS) {
+  SingleViewThreadsafeFS TFS(std::move(VFS));
+  ParseInputs Inputs;
+  Inputs.TFS = &TFS;
+  Inputs.CompileCommand = Command;
+  IgnoreDiagnostics IgnoreDiags;
+  return buildCompilerInvocation(Inputs, IgnoreDiags);
+}
+
+void applyModuleBuildInvocationSettings(CompilerInvocation &CI) {
+  // In clang's driver, we suppress ODR checks in GMF while building modules.
+  // Keep reuse validation aligned with that mode.
+  CI.getLangOpts().SkipODRCheckInGMF = true;
+
+  // Hash the contents of input files and preserve comments so reused BMIs match
+  // the way clangd originally built them.
+  CI.getHeaderSearchOpts().ValidateASTInputFilesContent = true;
+  CI.getPreprocessorOpts().WriteCommentListToPCH = true;
+  CI.getPreprocessorOpts().WriteCommentListToNamedModules = true;
+}
+
 bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-                          const CompilerInvocation *CI);
+                          const CompilerInvocation *CI,
+                          bool CheckStoredContextHash = true);
 
 // FailedPrerequisiteModules - stands for the PrerequisiteModules which has
 // errors happened during the building process.
@@ -354,6 +393,28 @@ public:
   }
 
 private:
+  class StaticPrerequisiteModules : public PrerequisiteModules {
+  public:
+    explicit StaticPrerequisiteModules(
+        llvm::ArrayRef<std::shared_ptr<const ModuleFile>> RequiredModules)
+        : RequiredModules(RequiredModules) {}
+
+    void adjustHeaderSearchOptions(HeaderSearchOptions &Options) const override {
+      for (const auto &RequiredModule : RequiredModules)
+        Options.PrebuiltModuleFiles.insert_or_assign(
+            RequiredModule->getModuleName().str(),
+            RequiredModule->getModuleFilePath().str());
+    }
+
+    bool canReuse(const CompilerInvocation &,
+                  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>) const override {
+      return false;
+    }
+
+  private:
+    llvm::ArrayRef<std::shared_ptr<const ModuleFile>> RequiredModules;
+  };
+
   bool hasSameRequiredModules(ProjectModules &ProjectModules) const {
     llvm::StringSet<> CurrentRequiredModuleNames;
     for (llvm::StringRef ModuleName :
@@ -422,6 +483,43 @@ private:
     return true;
   }
 
+  bool canReuseSourceBackedModule(
+      const ModuleFile &MF, size_t Index, const CompilerInvocation &ImporterCI,
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+      ProjectModules &ProjectModules) const {
+    PathRef RequiredSource = MF.getRequiredSourceForLookup().empty()
+                                 ? MainFile
+                                 : MF.getRequiredSourceForLookup();
+    std::string ModuleUnitFileName =
+        ProjectModules.getSourceForModuleName(MF.getModuleName(), RequiredSource);
+    if (ModuleUnitFileName.empty())
+      return false;
+
+    auto Cmd = CDB->getCompileCommand(ModuleUnitFileName);
+    if (!Cmd)
+      return false;
+
+    auto ValidationCI = buildCompilerInvocationForCommand(*Cmd, VFS);
+    if (!ValidationCI)
+      return false;
+    applyModuleBuildInvocationSettings(*ValidationCI);
+
+    CompilerInvocation ImportValidationCI(ImporterCI);
+    ImportValidationCI.getPreprocessorOpts() =
+        ValidationCI->getPreprocessorOpts();
+    if (!IsModuleFileUpToDate(MF.getModuleFilePath(), *this, VFS,
+                              &ImportValidationCI,
+                              /*CheckStoredContextHash=*/true))
+      return false;
+
+    // Revalidate the BMI against the prerequisite prefix that existed when it
+    // was originally built, not the whole final reusable set.
+    StaticPrerequisiteModules BuiltBeforeCurrent(
+        llvm::ArrayRef(RequiredModules).take_front(Index));
+    return IsModuleFileUpToDate(MF.getModuleFilePath(), BuiltBeforeCurrent, VFS,
+                                ValidationCI.get());
+  }
+
   llvm::SmallVector<std::shared_ptr<const ModuleFile>, 8> RequiredModules;
   std::string MainFile;
   const GlobalCompilationDatabase *CDB = nullptr;
@@ -434,10 +532,12 @@ private:
 bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
-                          const CompilerInvocation *CI = nullptr) {
+                          const CompilerInvocation *CI,
+                          bool CheckStoredContextHash) {
   if (CI)
     if (auto StoredContextHash = readModuleContextHashFile(ModuleFilePath, VFS);
-        StoredContextHash && *StoredContextHash != CI->computeContextHash())
+        CheckStoredContextHash &&
+            StoredContextHash && *StoredContextHash != CI->computeContextHash())
       return false;
 
   HeaderSearchOptions HSOpts;
@@ -535,18 +635,7 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
   if (!Buf)
     return llvm::createStringError("Failed to create buffer");
 
-  // In clang's driver, we will suppress the check for ODR violation in GMF.
-  // See the implementation of RenderModulesOptions in Clang.cpp.
-  CI->getLangOpts().SkipODRCheckInGMF = true;
-
-  // Hash the contents of input files and store the hash value to the BMI files.
-  // So that we can check if the files are still valid when we want to reuse the
-  // BMI files.
-  CI->getHeaderSearchOpts().ValidateASTInputFilesContent = true;
-  // Preserve doc comments in clangd-built BMIs so code-intelligence features
-  // (e.g. completion docs) can surface comments from imported modules.
-  CI->getPreprocessorOpts().WriteCommentListToPCH = true;
-  CI->getPreprocessorOpts().WriteCommentListToNamedModules = true;
+  applyModuleBuildInvocationSettings(*CI);
 
   BuiltModuleFiles.adjustHeaderSearchOptions(CI->getHeaderSearchOpts());
   const std::string ModuleContextHash = CI->computeContextHash();
@@ -610,13 +699,20 @@ bool ReusablePrerequisiteModules::canReuse(
   if (RequiredModules.empty())
     return true;
 
-  llvm::SmallVector<llvm::StringRef> BMIPaths;
-  for (auto &MF : RequiredModules)
-    BMIPaths.push_back(MF->getModuleFilePath());
-  return llvm::all_of(
-      BMIPaths, [this, VFS, &CI](auto ModuleFilePath) {
-        return IsModuleFileUpToDate(ModuleFilePath, *this, VFS, &CI);
-      });
+  for (size_t I = 0; I < RequiredModules.size(); ++I) {
+    const auto &MF = *RequiredModules[I];
+
+    if (MF.getModuleSourceIdentity().empty()) {
+      if (!IsModuleFileUpToDate(MF.getModuleFilePath(), *this, VFS, &CI,
+                                /*CheckStoredContextHash=*/false))
+        return false;
+      continue;
+    }
+
+    if (!canReuseSourceBackedModule(MF, I, CI, VFS, *ProjectModules))
+      return false;
+  }
+  return true;
 }
 
 class ModuleFileCache {
