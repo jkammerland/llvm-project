@@ -15,6 +15,7 @@
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/Utils.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
@@ -125,6 +126,60 @@ import Comments;
 
   const RawComment *RC = getCompletionComment(Ctx, foo);
   EXPECT_FALSE(RC);
+}
+
+TEST_F(NoComments, ModulesWriteCommentListOptInTest) {
+  addFile("Comments.cppm", R"cpp(
+export module Comments;
+
+/// Any comments
+void foo() {}
+  )cpp");
+
+  CreateInvocationOptions CIOpts;
+  CIOpts.VFS = llvm::vfs::createPhysicalFileSystem();
+  DiagnosticOptions DiagOpts;
+  IntrusiveRefCntPtr<DiagnosticsEngine> Diags =
+      CompilerInstance::createDiagnostics(*CIOpts.VFS, DiagOpts);
+  CIOpts.Diags = Diags;
+
+  std::string CacheBMIPath = llvm::Twine(TestDir + "/Comments.pcm").str();
+  const char *Args[] = {"clang++",       "-std=c++20",
+                        "--precompile",  "-working-directory",
+                        TestDir.c_str(), "Comments.cppm"};
+  std::shared_ptr<CompilerInvocation> Invocation =
+      createInvocation(Args, CIOpts);
+  ASSERT_TRUE(Invocation);
+  Invocation->getPreprocessorOpts().WriteCommentListToNamedModules = true;
+
+  CompilerInstance Instance(std::move(Invocation));
+  Instance.createVirtualFileSystem(CIOpts.VFS);
+  Instance.setDiagnostics(Diags);
+  Instance.getFrontendOpts().OutputFile = CacheBMIPath;
+  GenerateReducedModuleInterfaceAction Action;
+  ASSERT_TRUE(Instance.ExecuteAction(Action));
+  ASSERT_FALSE(Diags->hasErrorOccurred());
+
+  std::string DepArg =
+      llvm::Twine("-fmodule-file=Comments=" + CacheBMIPath).str();
+  std::unique_ptr<ASTUnit> AST = tooling::buildASTFromCodeWithArgs(
+      R"cpp(
+import Comments;
+        )cpp",
+      /*Args=*/{"-std=c++20", DepArg.c_str()});
+  EXPECT_TRUE(AST);
+
+  ASTContext &Ctx = AST->getASTContext();
+
+  using namespace clang::ast_matchers;
+  auto *foo = selectFirst<FunctionDecl>(
+      "foo", match(functionDecl(hasName("foo")).bind("foo"), Ctx));
+  EXPECT_TRUE(foo);
+
+  const RawComment *RC = getCompletionComment(Ctx, foo);
+  ASSERT_TRUE(RC);
+  EXPECT_TRUE(RC->getRawText(Ctx.getSourceManager()).trim() ==
+              "/// Any comments");
 }
 
 } // anonymous namespace
