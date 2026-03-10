@@ -311,6 +311,86 @@ private:
   mutable bool RemapMFromA = false;
 };
 
+class DiamondLookupFilenameSensitiveProjectModules : public ProjectModules {
+public:
+  DiamondLookupFilenameSensitiveProjectModules(PathRef TestDir,
+                                              const bool &RemapMFromB)
+      : TestDir(TestDir.str()), RemapMFromB(RemapMFromB) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "Use.cpp")
+      return {"X"};
+    if (FileName == "X.cppm")
+      return {"A", "B"};
+    if (FileName == "A.cppm" || FileName == "B.cppm")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "X.cppm")
+      return "X";
+    if (FileName == "A.cppm")
+      return "A";
+    if (FileName == "B.cppm")
+      return "B";
+    if (FileName == "M-A.cppm" || FileName == "M-B.cppm")
+      return "M";
+    return {};
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) override {
+    if (ModuleName == "X")
+      return getPathFor("X.cppm");
+    if (ModuleName == "A")
+      return getPathFor("A.cppm");
+    if (ModuleName == "B")
+      return getPathFor("B.cppm");
+    if (ModuleName != "M")
+      return {};
+
+    llvm::StringRef RequiredFileName =
+        llvm::sys::path::filename(RequiredSrcFile);
+    if (RequiredFileName == "A.cppm")
+      return getPathFor("M-A.cppm");
+    if (RequiredFileName == "B.cppm")
+      return getPathFor(RemapMFromB ? "M-B.cppm" : "M-A.cppm");
+    return {};
+  }
+
+private:
+  std::string getPathFor(llvm::StringRef RelativePath) const {
+    llvm::SmallString<128> FullPath(TestDir);
+    llvm::sys::path::append(FullPath, RelativePath);
+    return FullPath.str().str();
+  }
+
+  std::string TestDir;
+  const bool &RemapMFromB;
+};
+
+class DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase(
+      StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS), TestDir(TestDir) {}
+
+  void setRemapMFromB(bool Value) { RemapMFromB = Value; }
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    return std::make_unique<DiamondLookupFilenameSensitiveProjectModules>(
+        TestDir, RemapMFromB);
+  }
+
+private:
+  std::string TestDir;
+  mutable bool RemapMFromB = false;
+};
+
 class SourceSwitchingProjectModules : public ProjectModules {
 public:
   SourceSwitchingProjectModules(llvm::StringRef PrimarySource,
@@ -1612,6 +1692,57 @@ int useA = AValue + MValue;
   EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
+TEST_F(PrerequisiteModulesTests,
+       ReuseRejectsDiamondSourceRemapFromSecondParent) {
+  DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase CDB(TestDir,
+                                                                    FS);
+
+  CDB.addFile("M-A.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 43;
+  )cpp");
+
+  CDB.addFile("M-B.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 99;
+  )cpp");
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+import M;
+export constexpr int AValue = MValue;
+  )cpp");
+
+  CDB.addFile("B.cppm", R"cpp(
+export module B;
+import M;
+export constexpr int BValue = MValue;
+  )cpp");
+
+  CDB.addFile("X.cppm", R"cpp(
+export module X;
+import A;
+import B;
+export constexpr int XValue = AValue + BValue;
+  )cpp");
+
+  CDB.addFile("Use.cpp", R"cpp(
+import X;
+int useX = XValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto UseInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(UseInfo);
+
+  CDB.setRemapMFromB(true);
+  auto Invocation =
+      buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+}
+
 TEST_F(PrerequisiteModulesTests, PrebuiltModuleFileTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
@@ -1738,6 +1869,29 @@ int UseM = MValue;
       buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
   ASSERT_TRUE(NewInvocation);
   EXPECT_FALSE(ModuleInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseAcceptsModuleUnitOnlyCompileFlags) {
+  ModuleUnitFlagCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = MODULE_FLAG;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+
+  auto Invocation =
+      buildCompilerInvocation(getInputs("U.cpp", CDB), DiagConsumer);
+  ASSERT_TRUE(Invocation);
+  EXPECT_TRUE(ModuleInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
 TEST_F(PrerequisiteModulesTests, ReuseRejectsContextHashMismatch) {
@@ -1922,134 +2076,3 @@ int UseM = MValue;
 } // namespace clang::clangd
 
 #endif
-class DiamondLookupFilenameSensitiveProjectModules : public ProjectModules {
-public:
-  DiamondLookupFilenameSensitiveProjectModules(PathRef TestDir,
-                                              const bool &RemapMFromB)
-      : TestDir(TestDir.str()), RemapMFromB(RemapMFromB) {}
-
-  std::vector<std::string> getRequiredModules(PathRef File) override {
-    llvm::StringRef FileName = llvm::sys::path::filename(File);
-    if (FileName == "Use.cpp")
-      return {"X"};
-    if (FileName == "X.cppm")
-      return {"A", "B"};
-    if (FileName == "A.cppm" || FileName == "B.cppm")
-      return {"M"};
-    return {};
-  }
-
-  std::string getModuleNameForSource(PathRef File) override {
-    llvm::StringRef FileName = llvm::sys::path::filename(File);
-    if (FileName == "X.cppm")
-      return "X";
-    if (FileName == "A.cppm")
-      return "A";
-    if (FileName == "B.cppm")
-      return "B";
-    if (FileName == "M-A.cppm" || FileName == "M-B.cppm")
-      return "M";
-    return {};
-  }
-
-  std::string getSourceForModuleName(llvm::StringRef ModuleName,
-                                     PathRef RequiredSrcFile) override {
-    if (ModuleName == "X")
-      return getPathFor("X.cppm");
-    if (ModuleName == "A")
-      return getPathFor("A.cppm");
-    if (ModuleName == "B")
-      return getPathFor("B.cppm");
-    if (ModuleName != "M")
-      return {};
-
-    llvm::StringRef RequiredFileName =
-        llvm::sys::path::filename(RequiredSrcFile);
-    if (RequiredFileName == "A.cppm")
-      return getPathFor("M-A.cppm");
-    if (RequiredFileName == "B.cppm")
-      return getPathFor(RemapMFromB ? "M-B.cppm" : "M-A.cppm");
-    return {};
-  }
-
-private:
-  std::string getPathFor(llvm::StringRef RelativePath) const {
-    llvm::SmallString<128> FullPath(TestDir);
-    llvm::sys::path::append(FullPath, RelativePath);
-    return FullPath.str().str();
-  }
-
-  std::string TestDir;
-  const bool &RemapMFromB;
-};
-
-class DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase
-    : public MockDirectoryCompilationDatabase {
-public:
-  DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase(
-      StringRef TestDir, const ThreadsafeFS &TFS)
-      : MockDirectoryCompilationDatabase(TestDir, TFS), TestDir(TestDir) {}
-
-  void setRemapMFromB(bool Value) { RemapMFromB = Value; }
-
-  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
-    return std::make_unique<DiamondLookupFilenameSensitiveProjectModules>(
-        TestDir, RemapMFromB);
-  }
-
-private:
-  std::string TestDir;
-  mutable bool RemapMFromB = false;
-};
-
-TEST_F(PrerequisiteModulesTests,
-       ReuseRejectsDiamondSourceRemapFromSecondParent) {
-  DiamondLookupFilenameSensitiveMockDirectoryCompilationDatabase CDB(TestDir,
-                                                                    FS);
-
-  CDB.addFile("M-A.cppm", R"cpp(
-export module M;
-export constexpr int MValue = 43;
-  )cpp");
-
-  CDB.addFile("M-B.cppm", R"cpp(
-export module M;
-export constexpr int MValue = 99;
-  )cpp");
-
-  CDB.addFile("A.cppm", R"cpp(
-export module A;
-import M;
-export constexpr int AValue = MValue;
-  )cpp");
-
-  CDB.addFile("B.cppm", R"cpp(
-export module B;
-import M;
-export constexpr int BValue = MValue;
-  )cpp");
-
-  CDB.addFile("X.cppm", R"cpp(
-export module X;
-import A;
-import B;
-export constexpr int XValue = AValue + BValue;
-  )cpp");
-
-  CDB.addFile("Use.cpp", R"cpp(
-import X;
-int useX = XValue;
-  )cpp");
-
-  ModulesBuilder Builder(CDB);
-  auto UseInfo =
-      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
-  ASSERT_TRUE(UseInfo);
-
-  CDB.setRemapMFromB(true);
-  auto Invocation =
-      buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
-  ASSERT_TRUE(Invocation);
-  EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
-}
-
