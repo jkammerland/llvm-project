@@ -434,6 +434,49 @@ export int nn = 43;
   EXPECT_TRUE(NInfo->canReuse(*Invocation, FS.view(TestDir)));
 }
 
+TEST_F(PrerequisiteModulesTests, AddingImportInvalidatesReuse) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export int MValue = 43;
+  )cpp");
+
+  CDB.addFile("Use.cpp", R"cpp(
+int use() {
+  return 0;
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto UseInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  EXPECT_TRUE(UseInfo);
+
+  ParseInputs UseInput = getInputs("Use.cpp", CDB);
+  std::unique_ptr<CompilerInvocation> Invocation =
+      buildCompilerInvocation(UseInput, DiagConsumer);
+  EXPECT_TRUE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  CDB.addFile("Use.cpp", R"cpp(
+import M;
+int use() {
+  return MValue;
+}
+  )cpp");
+  UseInput = getInputs("Use.cpp", CDB);
+  Invocation = buildCompilerInvocation(UseInput, DiagConsumer);
+  EXPECT_FALSE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  UseInfo = Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  EXPECT_TRUE(UseInfo);
+  EXPECT_TRUE(UseInfo->canReuse(*Invocation, FS.view(TestDir)));
+
+  HeaderSearchOptions HSOpts;
+  UseInfo->adjustHeaderSearchOptions(HSOpts);
+  EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("M"));
+}
+
 TEST_F(PrerequisiteModulesTests, ModulesPreambleCompatibility) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
@@ -464,7 +507,8 @@ void foo() {}
                     /*Callback=*/nullptr);
   ASSERT_TRUE(Preamble);
   EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
-  EXPECT_TRUE(isPreambleCompatible(*Preamble, Use, getFullPath("Use.cpp"), *CI));
+  EXPECT_TRUE(isPreambleCompatible(*Preamble, Use, getFullPath("Use.cpp"),
+                                   *CI));
 }
 
 TEST_F(PrerequisiteModulesTests, IncludeDrivenImportInMainAST) {
