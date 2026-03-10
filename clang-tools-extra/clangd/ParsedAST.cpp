@@ -833,10 +833,14 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     std::vector<Diag> D = ASTDiags.take(&*CTContext);
     Diags.insert(Diags.end(), D.begin(), D.end());
   }
+  const bool ModulesPreambleBypassed =
+      Inputs.ModulesManager && Preamble &&
+      Preamble->Preamble.getBounds().Size == 0;
   ParsedAST Result(Filename, Inputs.Version, std::move(Preamble),
                    std::move(Clang), std::move(Action), std::move(Tokens),
                    std::move(Macros), std::move(Marks), std::move(ParsedDecls),
-                   std::move(Diags), std::move(Includes), std::move(PI));
+                   std::move(Diags), std::move(Includes), std::move(PI),
+                   ModulesPreambleBypassed);
   llvm::move(getIncludeCleanerDiags(Result, Inputs.Contents, *Inputs.TFS),
              std::back_inserter(Result.Diags));
   return std::move(Result);
@@ -930,13 +934,15 @@ ParsedAST::ParsedAST(PathRef TUPath, llvm::StringRef Version,
                      std::vector<PragmaMark> Marks,
                      std::vector<Decl *> LocalTopLevelDecls,
                      std::vector<Diag> Diags, IncludeStructure Includes,
-                     include_cleaner::PragmaIncludes PI)
+                     include_cleaner::PragmaIncludes PI,
+                     bool ModulesPreambleBypassed)
     : TUPath(TUPath), Version(Version), Preamble(std::move(Preamble)),
       Clang(std::move(Clang)), Action(std::move(Action)),
       Tokens(std::move(Tokens)), Macros(std::move(Macros)),
       Marks(std::move(Marks)), Diags(std::move(Diags)),
       LocalTopLevelDecls(std::move(LocalTopLevelDecls)),
       Includes(std::move(Includes)), PI(std::move(PI)),
+      ModulesPreambleBypassed(ModulesPreambleBypassed),
       Resolver(std::make_unique<HeuristicResolver>(getASTContext())) {
   assert(this->Clang);
   assert(this->Action);

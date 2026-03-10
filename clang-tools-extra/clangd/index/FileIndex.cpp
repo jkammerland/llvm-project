@@ -469,6 +469,12 @@ void FileIndex::updatePreamble(PathRef Path, llvm::StringRef Version,
 }
 
 void FileIndex::updateMain(PathRef Path, ParsedAST &AST) {
+  if (AST.bypassedPreambleForModules()) {
+    // Modules mode currently keeps some TUs on an empty preamble for
+    // correctness. Recover header symbols from the main AST in that case.
+    updatePreamble(Path, AST.version(), AST.getASTContext(),
+                   AST.getPreprocessor(), AST.getPragmaIncludes());
+  }
   auto Contents = indexMainDecls(AST);
   MainFileSymbols.update(
       URI::create(Path).toString(),

@@ -1247,6 +1247,11 @@ void ASTWorker::generateDiagnostics(
       Publish();
   };
   if (*AST) {
+    if (InputsAreLatest && Inputs.ModulesManager &&
+        isReliable(Inputs.CompileCommand) &&
+        (*LatestPreamble)->Preamble.getBounds().Size == 0) {
+      HeaderIncluders.update(FileName, (**AST).getIncludeStructure().allHeaders());
+    }
     trace::Span Span("Running main AST callback");
     Callbacks.onMainAST(FileName, **AST, RunPublish);
     updateASTSignals(**AST);

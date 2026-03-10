@@ -13,6 +13,7 @@
 #include "Diagnostics.h"
 #include "GlobalCompilationDatabase.h"
 #include "Matchers.h"
+#include "ModulesBuilder.h"
 #include "ParsedAST.h"
 #include "Preamble.h"
 #include "TUScheduler.h"
@@ -1436,6 +1437,113 @@ TEST_F(TUSchedulerTests, IncluderCache) {
   EXPECT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
   EXPECT_THAT(GetFlags(NoCmd), Contains("-DMAIN3"))
       << "association invalidated and then claimed by main3";
+}
+
+TEST_F(TUSchedulerTests, ModulesEmptyPreambleStillUpdatesIncluderCache) {
+  const std::string Main = testPath("main.cpp");
+  const std::string Header = testPath("no_cmd.h");
+  const std::string Module = testPath("A.cppm");
+
+  struct ModulesCDB : public MockCompilationDatabase {
+    ModulesCDB(std::string Main, std::string Header, std::string Module)
+        : Main(std::move(Main)), Header(std::move(Header)),
+          Module(std::move(Module)) {
+      ExtraClangFlags.push_back("-std=c++20");
+      ExtraClangFlags.push_back("-c");
+    }
+
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File == Header)
+        return std::nullopt;
+      auto Basic = getFallbackCommand(File);
+      Basic.Heuristic.clear();
+      Basic.CommandLine.push_back("-std=c++20");
+      Basic.CommandLine.push_back("-c");
+      if (File == Main)
+        Basic.CommandLine.push_back("-DMAIN");
+      return Basic;
+    }
+
+    std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+      class FixedProjectModules : public ProjectModules {
+      public:
+        FixedProjectModules(std::string Main, std::string Module)
+            : Main(std::move(Main)), Module(std::move(Module)) {}
+
+        std::vector<std::string> getRequiredModules(PathRef File) override {
+          return File == Main ? std::vector<std::string>{"A"}
+                              : std::vector<std::string>{};
+        }
+
+        std::string getModuleNameForSource(PathRef File) override {
+          return File == Module ? "A" : "";
+        }
+
+        void setCommandMangler(CommandMangler) override {}
+
+        std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                           PathRef) override {
+          return ModuleName == "A" ? Module : "";
+        }
+
+      private:
+        std::string Main;
+        std::string Module;
+      };
+
+      return std::make_unique<FixedProjectModules>(Main, Module);
+    }
+
+    std::string Main;
+    std::string Header;
+    std::string Module;
+  } CDB(Main, Header, Module);
+
+  ModulesBuilder Builder(CDB);
+  TUScheduler WithModules(CDB, optsForTest());
+  TUScheduler WithoutModules(CDB, optsForTest());
+
+  auto GetFlags = [&](TUScheduler &S, PathRef HeaderFile) {
+    S.update(HeaderFile, getInputs(HeaderFile, ";"), WantDiagnostics::Yes);
+    EXPECT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+    Notification CmdDone;
+    tooling::CompileCommand Cmd;
+    S.runWithPreamble("GetFlags", HeaderFile, TUScheduler::StaleOrAbsent,
+                      [&](llvm::Expected<InputsAndPreamble> Inputs) {
+                        ASSERT_FALSE(!Inputs) << Inputs.takeError();
+                        Cmd = std::move(Inputs->Command);
+                        CmdDone.notify();
+                      });
+    CmdDone.wait();
+    EXPECT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+    return Cmd.CommandLine;
+  };
+
+  FS.Files[Header] = ";";
+  FS.Files[Module] = R"cpp(
+export module A;
+export constexpr int AValue = 1;
+  )cpp";
+
+  const char *MainContents = R"cpp(
+    #include "no_cmd.h"
+    import A;
+    int use() { return AValue; }
+  )cpp";
+  FS.Files[Main] = MainContents;
+
+  // Sanity-check that ordinary preambles still teach the scheduler to borrow
+  // flags for headers without their own compile command.
+  WithoutModules.update(Main, getInputs(Main, MainContents), WantDiagnostics::Yes);
+  ASSERT_TRUE(WithoutModules.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_THAT(GetFlags(WithoutModules, Header), Contains("-DMAIN"));
+
+  ParseInputs ModulesInputs = getInputs(Main, MainContents);
+  ModulesInputs.ModulesManager = &Builder;
+  WithModules.update(Main, std::move(ModulesInputs), WantDiagnostics::Yes);
+  ASSERT_TRUE(WithModules.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_THAT(GetFlags(WithModules, Header), Contains("-DMAIN"));
 }
 
 TEST_F(TUSchedulerTests, PreservesLastActiveFile) {
