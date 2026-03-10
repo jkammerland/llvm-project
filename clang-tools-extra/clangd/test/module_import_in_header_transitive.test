@@ -1,33 +1,33 @@
-# A smoke test to check that a simple dependency chain for modules can work.
+# Regression test: transitive include chain carrying an import declaration
+# should still make imported symbols visible in the including TU.
 #
-# FIXME: The test fails on Windows; see comments on https://github.com/llvm/llvm-project/pull/142828
+# Windows have different escaping modes.
+# FIXME: We should add one for windows.
 # UNSUPPORTED: system-windows
 #
-# RUN: rm -fr %t
+# RUN: rm -rf %t
 # RUN: mkdir -p %t
 # RUN: split-file %s %t
 #
 # RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
 # RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
-# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc.tmp
-#
-# On Windows, we need the URI in didOpen to look like "uri":"file:///C:/..."
-# (with the extra slash in the front), so we add it here.
-# RUN: sed -E -e 's|"file://([A-Z]):/|"file:///\1:/|g' %/t/definition.jsonrpc.tmp > %/t/definition.jsonrpc
+# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
 #
 # RUN: clangd -experimental-modules-support -lit-test < %t/definition.jsonrpc \
 # RUN:      | FileCheck -strict-whitespace %t/definition.jsonrpc
 
-#--- A-frag.cppm
-export module A:frag;
-export void printA() {}
-
 #--- A.cppm
 export module A;
-export import :frag;
+export void printA() {}
+
+#--- HeaderInner.h
+import A;
+
+#--- HeaderOuter.h
+#include "HeaderInner.h"
 
 #--- Use.cpp
-import A;
+#include "HeaderOuter.h"
 void foo() {
     print
 }
@@ -36,18 +36,13 @@ void foo() {
 [
     {
       "directory": "DIR",
-      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/main.cpp.o -c DIR/Use.cpp",
+      "command": "CLANG_CC -std=c++20 -I DIR -o DIR/main.cpp.o -c DIR/Use.cpp",
       "file": "DIR/Use.cpp"
     },
     {
       "directory": "DIR",
       "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
       "file": "DIR/A.cppm"
-    },
-    {
-      "directory": "DIR",
-      "command": "CLANG_CC -std=c++20 DIR/A-frag.cppm --precompile -o DIR/A-frag.pcm",
-      "file": "DIR/A-frag.cppm"
     }
 ]
 
@@ -80,11 +75,12 @@ void foo() {
       "uri": "file://DIR/Use.cpp",
       "languageId": "cpp",
       "version": 1,
-      "text": "import A;\nvoid foo() {\n    print\n}\n"
+      "text": "#include \"HeaderOuter.h\"\nvoid foo() {\n    print\n}\n"
     }
   }
 }
 
+# CHECK-NOT: module_unimported_use
 # CHECK: "message"{{.*}}printA{{.*}}(fix available)
 
 ---
