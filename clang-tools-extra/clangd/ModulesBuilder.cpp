@@ -513,6 +513,23 @@ private:
         continue;
       }
 
+      auto HasSameExplicitPrebuiltConfiguration = [&](PathRef RequiredSource) {
+        auto Cmd = CDB->getCompileCommand(RequiredSource);
+        if (!Cmd)
+          return false;
+
+        auto ValidationCI = buildCompilerInvocationForCommand(*Cmd, VFS);
+        if (!ValidationCI)
+          return false;
+
+        auto It =
+            ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.find(
+                MF->getModuleName());
+        return It != ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.end() &&
+               maybeCaseFoldPath(It->second) ==
+                   maybeCaseFoldPath(MF->getModuleFilePath());
+      };
+
       auto HasSameSourceBackedConfiguration = [&](PathRef RequiredSource) {
         std::string ModuleUnitFileName =
             ProjectModules.getSourceForModuleName(MF->getModuleName(),
@@ -534,9 +551,17 @@ private:
                getCompileCommandFingerprint(*Cmd);
       };
 
+      auto HasSameConfiguration = [&](PathRef RequiredSource) {
+        if (MF->getModuleSourceIdentity().empty() &&
+            MF->getCompileCommandFingerprint().empty() &&
+            HasSameExplicitPrebuiltConfiguration(RequiredSource))
+          return true;
+        return HasSameSourceBackedConfiguration(RequiredSource);
+      };
+
       if (auto It = RequiredSourcesForLookup.find(MF->getModuleName());
           It != RequiredSourcesForLookup.end()) {
-        if (!llvm::all_of(It->second, HasSameSourceBackedConfiguration))
+        if (!llvm::all_of(It->second, HasSameConfiguration))
           return false;
         continue;
       }
@@ -544,7 +569,7 @@ private:
       PathRef RequiredSource = MF->getRequiredSourceForLookup().empty()
                                    ? MainFile
                                    : MF->getRequiredSourceForLookup();
-      if (!HasSameSourceBackedConfiguration(RequiredSource))
+      if (!HasSameConfiguration(RequiredSource))
         return false;
     }
     return true;
