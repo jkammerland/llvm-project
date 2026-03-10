@@ -803,6 +803,132 @@ D<B> S;
     EXPECT_NE(Diag.Name, "module_odr_violation_missing_decl");
 }
 
+TEST_F(PrerequisiteModulesTests, NoFalseModuleDeclNotAtStartWithGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+inline int GMFValue = 41;
+  )cpp");
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export import :Part;
+export int usePart();
+  )cpp");
+
+  CDB.addFile("M-part.cppm", R"cpp(
+module;
+#include "gmf.hpp"
+export module M:Part;
+export int partValue();
+  )cpp");
+
+  CDB.addFile("M-impl.cpp", R"cpp(
+module;
+#include "gmf.hpp"
+module M;
+import :Part;
+int usePart() {
+  return GMFValue + partValue();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M-impl.cpp", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("M-impl.cpp"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  ASSERT_TRUE(Preamble->RequiredModules);
+
+  auto AST = ParsedAST::build(getFullPath("M-impl.cpp"), Input, std::move(CI),
+                              {}, Preamble);
+  ASSERT_TRUE(AST);
+
+  for (const auto &Diag : AST->getDiagnostics())
+    EXPECT_NE(Diag.Name, "module_decl_not_at_start");
+}
+
+TEST_F(PrerequisiteModulesTests, ModuleDeclNotAtStartStillReportedWithoutGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("Bad.cpp", R"cpp(
+int prelude = 1;
+module Bad;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("Bad.cpp", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Bad.cpp"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto AST =
+      ParsedAST::build(getFullPath("Bad.cpp"), Input, std::move(CI), {},
+                       Preamble);
+  ASSERT_TRUE(AST);
+
+  bool SawModuleDeclNotAtStart = false;
+  for (const auto &Diag : AST->getDiagnostics())
+    SawModuleDeclNotAtStart |= (Diag.Name == "module_decl_not_at_start");
+  EXPECT_TRUE(SawModuleDeclNotAtStart);
+}
+
+TEST_F(PrerequisiteModulesTests,
+       ModuleDeclNotAtStartStillReportedForMisplacedModuleAfterGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+inline int GMFValue = 41;
+  )cpp");
+
+  CDB.addFile("Bad.cppm", R"cpp(
+module;
+#include "gmf.hpp"
+
+int prelude = GMFValue;
+export module Bad;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("Bad.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Bad.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto AST = ParsedAST::build(getFullPath("Bad.cppm"), Input, std::move(CI),
+                              {}, Preamble);
+  ASSERT_TRUE(AST);
+
+  bool SawModuleDeclNotAtStart = false;
+  for (const auto &Diag : AST->getDiagnostics())
+    SawModuleDeclNotAtStart |= (Diag.Name == "module_decl_not_at_start");
+  EXPECT_TRUE(SawModuleDeclNotAtStart);
+}
+
 // An end to end test for code complete in modules
 TEST_F(PrerequisiteModulesTests, CodeCompleteTest) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
