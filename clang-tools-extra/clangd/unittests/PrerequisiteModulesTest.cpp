@@ -395,6 +395,96 @@ private:
   mutable std::string PrebuiltMPath;
 };
 
+class NestedPrebuiltTransitiveProjectModules : public ProjectModules {
+public:
+  NestedPrebuiltTransitiveProjectModules(PathRef TestDir,
+                                         const bool &UseAlternateMSource)
+      : TestDir(TestDir.str()), UseAlternateMSource(UseAlternateMSource) {}
+
+  std::vector<std::string> getRequiredModules(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "Direct.cpp")
+      return {"M"};
+    if (FileName == "Use.cpp")
+      return {"X"};
+    if (FileName == "X.cppm")
+      return {"A"};
+    if (FileName == "A.cppm")
+      return {"M"};
+    return {};
+  }
+
+  std::string getModuleNameForSource(PathRef File) override {
+    llvm::StringRef FileName = llvm::sys::path::filename(File);
+    if (FileName == "X.cppm")
+      return "X";
+    if (FileName == "A.cppm")
+      return "A";
+    if (FileName == "M-old.cppm" || FileName == "M-new.cppm")
+      return "M";
+    return {};
+  }
+
+  std::string getSourceForModuleName(llvm::StringRef ModuleName,
+                                     PathRef RequiredSrcFile) override {
+    if (ModuleName == "X")
+      return getPathFor("X.cppm");
+    if (ModuleName == "A")
+      return getPathFor("A.cppm");
+    if (ModuleName != "M")
+      return {};
+
+    llvm::StringRef RequiredFileName =
+        llvm::sys::path::filename(RequiredSrcFile);
+    if (RequiredFileName == "Direct.cpp" || RequiredFileName == "A.cppm")
+      return getPathFor(UseAlternateMSource ? "M-new.cppm" : "M-old.cppm");
+    return {};
+  }
+
+private:
+  std::string getPathFor(llvm::StringRef RelativePath) const {
+    llvm::SmallString<128> FullPath(TestDir);
+    llvm::sys::path::append(FullPath, RelativePath);
+    return FullPath.str().str();
+  }
+
+  std::string TestDir;
+  const bool &UseAlternateMSource;
+};
+
+class NestedPrebuiltTransitiveCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  NestedPrebuiltTransitiveCompilationDatabase(StringRef TestDir,
+                                              const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS), TestDir(TestDir) {}
+
+  void setUseAlternateMSource(bool Value) { UseAlternateMSource = Value; }
+  void setPrebuiltMPath(llvm::StringRef Path) { PrebuiltMPath = Path.str(); }
+
+  std::unique_ptr<ProjectModules> getProjectModules(PathRef) const override {
+    return std::make_unique<NestedPrebuiltTransitiveProjectModules>(
+        TestDir, UseAlternateMSource);
+  }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+
+    if (llvm::sys::path::filename(File) == "A.cppm" && !PrebuiltMPath.empty())
+      Cmd->CommandLine.push_back("-fmodule-file=M=" + PrebuiltMPath);
+
+    return Cmd;
+  }
+
+private:
+  std::string TestDir;
+  mutable bool UseAlternateMSource = false;
+  mutable std::string PrebuiltMPath;
+};
+
 class DiamondLookupFilenameSensitiveProjectModules : public ProjectModules {
 public:
   DiamondLookupFilenameSensitiveProjectModules(PathRef TestDir,
@@ -2505,6 +2595,68 @@ int UseA = AValue;
       buildCompilerInvocation(getInputs("Use.cpp", CDB), DiagConsumer);
   ASSERT_TRUE(NewInvocation);
   EXPECT_FALSE(UseInfo->canReuse(*NewInvocation, FS.view(TestDir)));
+}
+
+TEST_F(PrerequisiteModulesTests,
+       BuildUsesNestedTransitivePrebuiltModuleMapping) {
+  NestedPrebuiltTransitiveCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M-old.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("M-new.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 2;
+  )cpp");
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+import M;
+export constexpr int AValue = MValue;
+  )cpp");
+  CDB.addFile("X.cppm", R"cpp(
+export module X;
+import A;
+export constexpr int XValue = AValue;
+  )cpp");
+  CDB.addFile("Direct.cpp", R"cpp(
+import M;
+int DirectUse = MValue;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+import X;
+int UseX = XValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  auto OldMInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Direct.cpp"), FS);
+  ASSERT_TRUE(OldMInfo);
+  HeaderSearchOptions OldMHS(TestDir);
+  OldMInfo->adjustHeaderSearchOptions(OldMHS);
+  ASSERT_TRUE(OldMHS.PrebuiltModuleFiles.count("M"));
+  std::string OldMPath = OldMHS.PrebuiltModuleFiles["M"];
+
+  CDB.setUseAlternateMSource(true);
+  auto NewMInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Direct.cpp"), FS);
+  ASSERT_TRUE(NewMInfo);
+  HeaderSearchOptions NewMHS(TestDir);
+  NewMInfo->adjustHeaderSearchOptions(NewMHS);
+  ASSERT_TRUE(NewMHS.PrebuiltModuleFiles.count("M"));
+  std::string NewMPath = NewMHS.PrebuiltModuleFiles["M"];
+  ASSERT_NE(OldMPath, NewMPath);
+
+  CDB.setPrebuiltMPath(OldMPath);
+  auto UseInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("Use.cpp"), FS);
+  ASSERT_TRUE(UseInfo);
+  HeaderSearchOptions UseHS(TestDir);
+  UseInfo->adjustHeaderSearchOptions(UseHS);
+  ASSERT_TRUE(UseHS.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_EQ(UseHS.PrebuiltModuleFiles["M"], OldMPath);
 }
 
 TEST_F(PrerequisiteModulesTests, PrebuiltRejectsMissingModuleFile) {
