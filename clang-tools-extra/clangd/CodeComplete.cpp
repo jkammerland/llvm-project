@@ -904,6 +904,30 @@ static bool isExcludedMember(const NamedDecl &D) {
   return false;
 }
 
+// Sema may produce macro candidates from non-visible definitions (e.g. from
+// named module internals). Check visibility at the completion point.
+static bool isVisibleMacroResultAtCodeCompletion(
+    Preprocessor &PP, const CodeCompletionResult &Result) {
+  assert(Result.Kind == CodeCompletionResult::RK_Macro);
+  assert(Result.MacroDefInfo);
+
+  auto VisibleDef =
+      PP.getMacroDefinitionAtLoc(Result.Macro, PP.getCodeCompletionLoc());
+  if (!VisibleDef)
+    return false;
+
+  if (VisibleDef.getMacroInfo() == Result.MacroDefInfo)
+    return true;
+  if (auto *LocalDirective = VisibleDef.getLocalDirective();
+      LocalDirective && LocalDirective->getMacroInfo() == Result.MacroDefInfo)
+    return true;
+
+  for (const auto *ModuleMacro : VisibleDef.getModuleMacros())
+    if (ModuleMacro->getMacroInfo() == Result.MacroDefInfo)
+      return true;
+  return false;
+}
+
 // The CompletionRecorder captures Sema code-complete output, including context.
 // It filters out ignored results (but doesn't apply fuzzy-filtering yet).
 // It doesn't do scoring or conversion to CompletionItem yet, as we want to
@@ -983,6 +1007,10 @@ struct CompletionRecorder : public CodeCompleteConsumer {
       // E.g. show injected A::A in `using A::A^` but not in "A^".
       if (Result.Declaration && !Context.getCXXScopeSpecifier() &&
           isInjectedClass(*Result.Declaration))
+        continue;
+      if (Result.Kind == CodeCompletionResult::RK_Macro &&
+          Result.MacroDefInfo &&
+          !isVisibleMacroResultAtCodeCompletion(S.getPreprocessor(), Result))
         continue;
       // We choose to never append '::' to completion results in clangd.
       Result.StartsNestedNameSpecifier = false;
