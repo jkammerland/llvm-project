@@ -1424,6 +1424,7 @@ bool semaCodeComplete(std::unique_ptr<CodeCompleteConsumer> Consumer,
                                Input.Offset == PreambleRegion.Size);
   if (Input.Patch)
     Input.Patch->apply(*CI);
+  applyRequiredModulesSettings(Input.Preamble.RequiredModules.get(), *CI);
   // NOTE: we must call BeginSourceFile after prepareCompilerInstance. Otherwise
   // the remapped buffers do not get freed.
   llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS =
@@ -1435,10 +1436,6 @@ bool semaCodeComplete(std::unique_ptr<CodeCompleteConsumer> Consumer,
       std::move(ContentsBuffer), std::move(VFS), IgnoreDiags);
   Clang->getPreprocessorOpts().SingleFileParseMode = CompletingInPreamble;
   Clang->setCodeCompletionConsumer(Consumer.release());
-
-  if (Input.Preamble.RequiredModules)
-    Input.Preamble.RequiredModules->adjustHeaderSearchOptions(
-        Clang->getHeaderSearchOpts());
 
   SyntaxOnlyAction Action;
   if (!Action.BeginSourceFile(*Clang, Clang->getFrontendOpts().Inputs[0])) {

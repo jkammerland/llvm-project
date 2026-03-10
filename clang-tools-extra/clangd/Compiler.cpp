@@ -127,6 +127,15 @@ buildCompilerInvocation(const ParseInputs &Inputs, clang::DiagnosticConsumer &D,
   return CI;
 }
 
+void applyRequiredModulesSettings(const PrerequisiteModules *RequiredModules,
+                                  CompilerInvocation &CI) {
+  if (!RequiredModules)
+    return;
+
+  RequiredModules->adjustHeaderSearchOptions(CI.getHeaderSearchOpts());
+  CI.getLangOpts().SkipODRCheckInGMF = true;
+}
+
 std::unique_ptr<CompilerInstance>
 prepareCompilerInstance(std::unique_ptr<clang::CompilerInvocation> CI,
                         const PrecompiledPreamble *Preamble,
