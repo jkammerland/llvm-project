@@ -1123,9 +1123,28 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
   for (const auto &ReqModule : ReqModules) {
     llvm::StringRef ReqModuleName = ReqModule.Name;
     if (BuiltModuleFiles.isModuleUnitBuilt(ReqModuleName)) {
-      BuiltModuleFiles.recordRequiredSourceForLookup(ReqModuleName,
-                                                     ReqModule.RequiredSource);
-      continue;
+      if (auto Cmd = getCDB().getCompileCommand(ReqModule.RequiredSource)) {
+        auto ValidationCI =
+            buildCompilerInvocationForCommand(*Cmd, TFS.view(std::nullopt));
+        if (ValidationCI) {
+          if (auto It =
+                  ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.find(
+                      ReqModuleName);
+              It != ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.end() &&
+              IsModuleFileUpToDate(It->second, BuiltModuleFiles,
+                                   TFS.view(std::nullopt), ValidationCI.get())) {
+            if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
+                    ReqModuleName, ValidationCI.get(),
+                    /*ModuleSourceIdentity=*/"",
+                    /*CompileCommandFingerprint=*/""))
+              return llvm::createStringError(llvm::formatv(
+                  "Conflicting module lookup for module {0}", ReqModuleName));
+            BuiltModuleFiles.recordRequiredSourceForLookup(
+                ReqModuleName, ReqModule.RequiredSource);
+            continue;
+          }
+        }
+      }
     }
 
     if (getExplicitPrebuiltModuleFile(ReqModule.RequiredSource, ReqModuleName,
