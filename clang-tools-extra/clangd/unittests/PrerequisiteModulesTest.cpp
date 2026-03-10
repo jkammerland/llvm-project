@@ -778,6 +778,28 @@ private:
   std::string ModuleOutputArg = "module-output-a.pcm";
 };
 
+class ExplicitPrebuiltCompilationDatabase
+    : public MockDirectoryCompilationDatabase {
+public:
+  ExplicitPrebuiltCompilationDatabase(StringRef TestDir, const ThreadsafeFS &TFS)
+      : MockDirectoryCompilationDatabase(TestDir, TFS) {}
+
+  void setPrebuiltMPath(llvm::StringRef Path) { PrebuiltMPath = Path.str(); }
+
+  std::optional<tooling::CompileCommand>
+  getCompileCommand(PathRef File) const override {
+    auto Cmd = MockDirectoryCompilationDatabase::getCompileCommand(File);
+    if (!Cmd)
+      return std::nullopt;
+    if (llvm::sys::path::filename(File) == "U.cpp" && !PrebuiltMPath.empty())
+      Cmd->CommandLine.push_back("-fmodule-file=M=" + PrebuiltMPath);
+    return Cmd;
+  }
+
+private:
+  std::string PrebuiltMPath;
+};
+
 // Add files to the working testing directory and the compilation database.
 void MockDirectoryCompilationDatabase::addFile(llvm::StringRef Path,
                                                llvm::StringRef Contents) {
@@ -2743,6 +2765,39 @@ int UseM = MValue;
   ASSERT_TRUE(HS2.PrebuiltModuleFiles.count("M"));
 
   EXPECT_NE(OldPrebuiltPath, HS2.PrebuiltModuleFiles["M"]);
+}
+
+TEST_F(PrerequisiteModulesTests, ReuseAcceptsStableExplicitPrebuiltModule) {
+  ExplicitPrebuiltCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export constexpr int MValue = 1;
+  )cpp");
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+int UseM = MValue;
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+  auto ModuleInfo =
+      Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo);
+  HeaderSearchOptions HS(TestDir);
+  ModuleInfo->adjustHeaderSearchOptions(HS);
+  ASSERT_TRUE(HS.PrebuiltModuleFiles.count("M"));
+  std::string OldPrebuiltPath = HS.PrebuiltModuleFiles["M"];
+
+  CDB.setPrebuiltMPath(OldPrebuiltPath);
+  ModulesBuilder Builder2(CDB);
+  auto ModuleInfo2 =
+      Builder2.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo2);
+  HeaderSearchOptions HS2(TestDir);
+  ModuleInfo2->adjustHeaderSearchOptions(HS2);
+  ASSERT_TRUE(HS2.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_EQ(OldPrebuiltPath, HS2.PrebuiltModuleFiles["M"]);
 }
 
 TEST_F(PrerequisiteModulesTests, PrebuiltRejectsCompileCommandMismatch) {
