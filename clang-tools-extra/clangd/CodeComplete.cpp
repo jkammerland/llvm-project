@@ -1454,7 +1454,7 @@ bool semaCodeComplete(std::unique_ptr<CodeCompleteConsumer> Consumer,
                               (!PreambleRegion.PreambleEndsAtStartOfLine &&
                                Input.Offset == PreambleRegion.Size);
   std::optional<PreamblePatch> BypassPatch;
-  if (ModulesPreambleBypassed) {
+  if (ModulesPreambleBypassed && !CompletingInPreamble) {
     BypassPatch = PreamblePatch::createBypassPatch(Input.FileName,
                                                    Input.ParseInput,
                                                    Input.Preamble);

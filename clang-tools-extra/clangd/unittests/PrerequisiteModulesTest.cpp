@@ -1690,6 +1690,91 @@ int usePart() {
   EXPECT_FALSE(BypassPatchSawModuleDeclNotAtStart);
 }
 
+TEST_F(PrerequisiteModulesTests,
+       ModulesBypassPatchNeedsPreambleSkipForCodeComplete) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+#ifdef CLANGD_GMF_SEEN
+#error included twice
+#endif
+#define CLANGD_GMF_SEEN 1
+inline int GMFValue = 41;
+  )cpp");
+
+  CDB.addFile("M.cppm", R"cpp(
+module;
+#include "gmf.hpp"
+export module M;
+export inline int useGMF() { return GMFValue; }
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Input.Contents, getFullPath("M.cppm")), 0);
+  auto Preamble =
+      buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_TRUE(
+      bypassedPreambleForModules(Input, *Preamble, NaturalPreambleBounds));
+
+  auto BypassPatch =
+      PreamblePatch::createBypassPatch(getFullPath("M.cppm"), Input, *Preamble);
+
+  auto ParseWithSetup = [&](const PreamblePatch *Patch,
+                            const PrecompiledPreamble *PreamblePCH) {
+    StoreDiags RawDiags;
+    auto ParseCI = buildCompilerInvocation(Input, RawDiags);
+    EXPECT_TRUE(ParseCI);
+    if (!ParseCI)
+      return std::vector<Diag>{};
+
+    applyRequiredModulesSettings(Preamble->RequiredModules.get(), *ParseCI);
+    if (Patch)
+      Patch->apply(*ParseCI);
+
+    auto Clang = prepareCompilerInstance(
+        std::move(ParseCI), PreamblePCH,
+        llvm::MemoryBuffer::getMemBufferCopy(Input.Contents,
+                                             getFullPath("M.cppm")),
+        Input.TFS->view(Input.CompileCommand.Directory), RawDiags);
+    EXPECT_TRUE(Clang);
+    if (!Clang)
+      return std::vector<Diag>{};
+
+    SyntaxOnlyAction Action;
+    EXPECT_TRUE(
+        Action.BeginSourceFile(*Clang, Clang->getFrontendOpts().Inputs[0]));
+    if (llvm::Error Err = Action.Execute())
+      ADD_FAILURE() << llvm::toString(std::move(Err));
+    Action.EndSourceFile();
+    return RawDiags.take();
+  };
+
+  auto SawIncludedTwice = [](llvm::ArrayRef<Diag> Diags) {
+    for (const auto &Diag : Diags) {
+      if (llvm::StringRef(Diag.Message).contains("included twice"))
+        return true;
+    }
+    return false;
+  };
+
+  EXPECT_TRUE(SawIncludedTwice(ParseWithSetup(&BypassPatch, nullptr)));
+  EXPECT_FALSE(SawIncludedTwice(ParseWithSetup(nullptr, nullptr)));
+  EXPECT_FALSE(SawIncludedTwice(
+      ParseWithSetup(&BypassPatch, &Preamble->Preamble)));
+}
+
 TEST_F(PrerequisiteModulesTests, ModuleDeclNotAtStartStillReportedWithoutGMF) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
