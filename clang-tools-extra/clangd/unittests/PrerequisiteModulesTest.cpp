@@ -14,11 +14,14 @@
 #include "Annotations.h"
 #include "CodeComplete.h"
 #include "Compiler.h"
+#include "Diagnostics.h"
 #include "ModulesBuilder.h"
 #include "ScanningProjectModules.h"
 #include "TestTU.h"
+#include "clang/Frontend/FrontendActions.h"
 #include "support/ThreadsafeFS.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
@@ -1586,6 +1589,107 @@ int usePart() {
     EXPECT_NE(Diag.Name, "module_decl_not_at_start");
 }
 
+TEST_F(PrerequisiteModulesTests, ModulesBypassPatchPreservesGMFState) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+inline int GMFValue = 41;
+  )cpp");
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+export import :Part;
+export int usePart();
+  )cpp");
+
+  CDB.addFile("M-part.cppm", R"cpp(
+module;
+#include "gmf.hpp"
+export module M:Part;
+export int partValue();
+  )cpp");
+
+  CDB.addFile("M-impl.cpp", R"cpp(
+module;
+#include "gmf.hpp"
+module M;
+import :Part;
+int usePart() {
+  return GMFValue + partValue();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M-impl.cpp", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Input.Contents, getFullPath("M-impl.cpp")), 0);
+  auto Preamble =
+      buildPreamble(getFullPath("M-impl.cpp"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  ASSERT_TRUE(Preamble->RequiredModules);
+  EXPECT_TRUE(
+      bypassedPreambleForModules(Input, *Preamble, NaturalPreambleBounds));
+
+  auto FullPatch =
+      PreamblePatch::createFullPatch(getFullPath("M-impl.cpp"), Input, *Preamble);
+  auto BypassPatch =
+      PreamblePatch::createBypassPatch(getFullPath("M-impl.cpp"), Input,
+                                       *Preamble);
+  EXPECT_THAT(FullPatch.text(), testing::Not(testing::HasSubstr("module;")));
+  EXPECT_THAT(FullPatch.text(), testing::HasSubstr("#include \"gmf.hpp\""));
+  EXPECT_THAT(BypassPatch.text(), testing::HasSubstr("module;"));
+  EXPECT_THAT(BypassPatch.text(), testing::HasSubstr("#include \"gmf.hpp\""));
+
+  auto ParseWithPatch = [&](const PreamblePatch &Patch) {
+    StoreDiags RawDiags;
+    auto ParseCI = buildCompilerInvocation(Input, RawDiags);
+    EXPECT_TRUE(ParseCI);
+    if (!ParseCI)
+      return std::vector<Diag>{};
+
+    applyRequiredModulesSettings(Preamble->RequiredModules.get(), *ParseCI);
+    Patch.apply(*ParseCI);
+
+    auto Clang = prepareCompilerInstance(
+        std::move(ParseCI), &Preamble->Preamble,
+        llvm::MemoryBuffer::getMemBufferCopy(Input.Contents,
+                                             getFullPath("M-impl.cpp")),
+        Input.TFS->view(Input.CompileCommand.Directory), RawDiags);
+    EXPECT_TRUE(Clang);
+    if (!Clang)
+      return std::vector<Diag>{};
+
+    SyntaxOnlyAction Action;
+    EXPECT_TRUE(
+        Action.BeginSourceFile(*Clang, Clang->getFrontendOpts().Inputs[0]));
+    if (llvm::Error Err = Action.Execute())
+      ADD_FAILURE() << llvm::toString(std::move(Err));
+    Action.EndSourceFile();
+    return RawDiags.take();
+  };
+
+  bool FullPatchSawModuleDeclNotAtStart = false;
+  for (const auto &Diag : ParseWithPatch(FullPatch))
+    FullPatchSawModuleDeclNotAtStart |=
+        (Diag.Name == "module_decl_not_at_start");
+  EXPECT_TRUE(FullPatchSawModuleDeclNotAtStart);
+
+  bool BypassPatchSawModuleDeclNotAtStart = false;
+  for (const auto &Diag : ParseWithPatch(BypassPatch))
+    BypassPatchSawModuleDeclNotAtStart |=
+        (Diag.Name == "module_decl_not_at_start");
+  EXPECT_FALSE(BypassPatchSawModuleDeclNotAtStart);
+}
+
 TEST_F(PrerequisiteModulesTests, ModuleDeclNotAtStartStillReportedWithoutGMF) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
@@ -1611,46 +1715,6 @@ module Bad;
   auto AST =
       ParsedAST::build(getFullPath("Bad.cpp"), Input, std::move(CI), {},
                        Preamble);
-  ASSERT_TRUE(AST);
-
-  bool SawModuleDeclNotAtStart = false;
-  for (const auto &Diag : AST->getDiagnostics())
-    SawModuleDeclNotAtStart |= (Diag.Name == "module_decl_not_at_start");
-  EXPECT_TRUE(SawModuleDeclNotAtStart);
-}
-
-TEST_F(PrerequisiteModulesTests,
-       ModuleDeclNotAtStartStillReportedForMisplacedModuleAfterGMF) {
-  MockDirectoryCompilationDatabase CDB(TestDir, FS);
-
-  CDB.addFile("gmf.hpp", R"cpp(
-inline int GMFValue = 41;
-  )cpp");
-
-  CDB.addFile("Bad.cppm", R"cpp(
-module;
-#include "gmf.hpp"
-
-int prelude = GMFValue;
-export module Bad;
-  )cpp");
-
-  ModulesBuilder Builder(CDB);
-
-  ParseInputs Input = getInputs("Bad.cppm", CDB);
-  Input.ModulesManager = &Builder;
-
-  std::unique_ptr<CompilerInvocation> CI =
-      buildCompilerInvocation(Input, DiagConsumer);
-  ASSERT_TRUE(CI);
-
-  auto Preamble =
-      buildPreamble(getFullPath("Bad.cppm"), *CI, Input, /*InMemory=*/true,
-                    /*Callback=*/nullptr);
-  ASSERT_TRUE(Preamble);
-
-  auto AST = ParsedAST::build(getFullPath("Bad.cppm"), Input, std::move(CI),
-                              {}, Preamble);
   ASSERT_TRUE(AST);
 
   bool SawModuleDeclNotAtStart = false;

@@ -91,73 +91,6 @@ template <class T> std::size_t getUsedBytes(const std::vector<T> &Vec) {
   return Vec.capacity() * sizeof(T);
 }
 
-llvm::StringRef skipLeadingWhitespaceAndComments(llvm::StringRef Code) {
-  while (true) {
-    Code = Code.ltrim();
-
-    // Ignore a potential UTF-8 BOM in the buffer start.
-    if (Code.consume_front("\xEF\xBB\xBF"))
-      continue;
-
-    if (Code.consume_front("//")) {
-      size_t NewlinePos = Code.find('\n');
-      if (NewlinePos == llvm::StringRef::npos)
-        return "";
-      Code = Code.drop_front(NewlinePos + 1);
-      continue;
-    }
-
-    if (Code.consume_front("/*")) {
-      size_t EndComment = Code.find("*/");
-      if (EndComment == llvm::StringRef::npos)
-        return "";
-      Code = Code.drop_front(EndComment + 2);
-      continue;
-    }
-
-    return Code;
-  }
-}
-
-llvm::StringRef skipLeadingWhitespaceCommentsAndDirectives(
-    llvm::StringRef Code) {
-  while (true) {
-    Code = skipLeadingWhitespaceAndComments(Code);
-    if (!Code.consume_front("#"))
-      return Code;
-    size_t EndDirective = Code.find('\n');
-    if (EndDirective == llvm::StringRef::npos)
-      return "";
-    Code = Code.drop_front(EndDirective + 1);
-  }
-}
-
-bool hasNamedModuleDeclImmediatelyAfterLeadingGMF(llvm::StringRef Code) {
-  Code = skipLeadingWhitespaceAndComments(Code);
-  if (!Code.consume_front("module"))
-    return false;
-  if (!Code.empty() && isAsciiIdentifierContinue(Code.front()))
-    return false;
-  Code = skipLeadingWhitespaceAndComments(Code);
-  if (!Code.consume_front(";"))
-    return false;
-
-  Code = skipLeadingWhitespaceCommentsAndDirectives(Code);
-  if (Code.consume_front("export")) {
-    if (!Code.empty() && isAsciiIdentifierContinue(Code.front()))
-      return false;
-    Code = skipLeadingWhitespaceCommentsAndDirectives(Code);
-  }
-
-  if (!Code.consume_front("module"))
-    return false;
-  if (!Code.empty() && isAsciiIdentifierContinue(Code.front()))
-    return false;
-
-  Code = skipLeadingWhitespaceAndComments(Code);
-  return !Code.empty() && Code.front() != ';';
-}
-
 class DeclTrackingASTConsumer : public ASTConsumer {
 public:
   DeclTrackingASTConsumer(std::vector<Decl *> &TopLevelDecls)
@@ -495,9 +428,6 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // Command-line parsing sets DisableFree to true by default, but we don't want
   // to leak memory in clangd.
   CI->getFrontendOpts().DisableFree = false;
-  const PrecompiledPreamble *PreamblePCH =
-      Preamble ? &Preamble->Preamble : nullptr;
-
   // This is on-by-default in windows to allow parsing SDK headers, but it
   // breaks many features. Disable it for the main-file (not preamble).
   CI->getLangOpts().DelayedTemplateParsing = false;
@@ -521,13 +451,23 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   if (Preamble)
     applyRequiredModulesSettings(Preamble->RequiredModules.get(), *CI);
 
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(), llvm::MemoryBufferRef(Inputs.Contents, Filename), 0);
+  const bool ModulesPreambleBypassed =
+      Preamble && clangd::bypassedPreambleForModules(Inputs, *Preamble,
+                                                     NaturalPreambleBounds);
+  const PrecompiledPreamble *PreamblePCH =
+      Preamble ? &Preamble->Preamble : nullptr;
+
   std::optional<PreamblePatch> Patch;
   // We might use an ignoring diagnostic consumer if they are going to be
   // dropped later on to not pay for extra latency by processing them.
   DiagnosticConsumer *DiagConsumer = &ASTDiags;
   IgnoreDiagnostics DropDiags;
   if (Preamble) {
-    Patch = PreamblePatch::createFullPatch(Filename, Inputs, *Preamble);
+    Patch = ModulesPreambleBypassed
+                ? PreamblePatch::createBypassPatch(Filename, Inputs, *Preamble)
+                : PreamblePatch::createFullPatch(Filename, Inputs, *Preamble);
     Patch->apply(*CI);
   }
   auto Clang = prepareCompilerInstance(
@@ -609,9 +549,6 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   auto BuildDir = VFS->getCurrentWorkingDirectory();
   std::optional<IncludeFixer> FixIncludes;
   llvm::DenseMap<diag::kind, DiagnosticsEngine::Level> OverriddenSeverity;
-  const bool HasNamedModuleDeclImmediatelyAfterLeadingGMF =
-      Inputs.ModulesManager &&
-      hasNamedModuleDeclImmediatelyAfterLeadingGMF(Inputs.Contents);
   // No need to run clang-tidy or IncludeFixerif we are not going to surface
   // diagnostics.
   {
@@ -658,13 +595,6 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
       if (Cfg.Diagnostics.SuppressAll ||
           isDiagnosticSuppressed(Info, Cfg.Diagnostics.Suppress,
                                  Clang->getLangOpts()))
-        return DiagnosticsEngine::Ignored;
-
-      // FIXME: remove this once clangd's modules workflow no longer reports
-      // err_module_decl_not_at_start in files that start with `module;`.
-      if (HasNamedModuleDeclImmediatelyAfterLeadingGMF &&
-          (Info.getID() == diag::err_module_decl_not_at_start ||
-           Info.getID() == diag::note_global_module_introducer_missing))
         return DiagnosticsEngine::Ignored;
 
       auto It = OverriddenSeverity.find(Info.getID());
@@ -747,11 +677,13 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // If we are using a preamble, copy existing includes.
   if (Preamble) {
     Includes = Preamble->Includes;
-    Includes.MainFileIncludes = Patch->preambleIncludes();
-    // Replay the preamble includes so that clang-tidy checks can see them.
-    ReplayPreamble::attach(Patch->preambleIncludes(), *Clang,
-                           Patch->modifiedBounds());
     PI = *Preamble->Pragmas;
+    if (Patch && !ModulesPreambleBypassed) {
+      Includes.MainFileIncludes = Patch->preambleIncludes();
+      // Replay the preamble includes so that clang-tidy checks can see them.
+      ReplayPreamble::attach(Patch->preambleIncludes(), *Clang,
+                             Patch->modifiedBounds());
+    }
   }
   // Important: collectIncludeStructure is registered *after* ReplayPreamble!
   // Otherwise we would collect the replayed includes again...
@@ -764,7 +696,7 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // with non-preamble macros below.
   MainFileMacros Macros;
   std::vector<PragmaMark> Marks;
-  if (Preamble) {
+  if (Patch && !ModulesPreambleBypassed) {
     Macros = Patch->mainFileMacros();
     Marks = Patch->marks();
   }
@@ -826,18 +758,13 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // FIXME: Also skip generation of diagnostics altogether to speed up ast
   // builds when we are patching a stale preamble.
   // Add diagnostics from the preamble, if any.
-  if (Preamble)
+  if (Patch && !ModulesPreambleBypassed)
     llvm::append_range(Diags, Patch->patchedDiags());
   // Finally, add diagnostics coming from the AST.
   {
     std::vector<Diag> D = ASTDiags.take(&*CTContext);
     Diags.insert(Diags.end(), D.begin(), D.end());
   }
-  const auto NaturalPreambleBounds = ComputePreambleBounds(
-      Clang->getLangOpts(), llvm::MemoryBufferRef(Inputs.Contents, Filename), 0);
-  const bool ModulesPreambleBypassed =
-      Preamble && Preamble->Preamble.getBounds().Size == 0 &&
-      shouldBypassPreambleForModules(Inputs, NaturalPreambleBounds);
   ParsedAST Result(Filename, Inputs.Version, std::move(Preamble),
                    std::move(Clang), std::move(Action), std::move(Tokens),
                    std::move(Macros), std::move(Marks), std::move(ParsedDecls),

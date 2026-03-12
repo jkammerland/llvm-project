@@ -1447,11 +1447,23 @@ bool semaCodeComplete(std::unique_ptr<CodeCompleteConsumer> Consumer,
   // skip all includes in this case; these completions are really simple.
   PreambleBounds PreambleRegion =
       ComputePreambleBounds(CI->getLangOpts(), *ContentsBuffer, 0);
+  const bool ModulesPreambleBypassed =
+      bypassedPreambleForModules(Input.ParseInput, Input.Preamble,
+                                 PreambleRegion);
   bool CompletingInPreamble = Input.Offset < PreambleRegion.Size ||
                               (!PreambleRegion.PreambleEndsAtStartOfLine &&
                                Input.Offset == PreambleRegion.Size);
-  if (Input.Patch)
+  std::optional<PreamblePatch> BypassPatch;
+  if (ModulesPreambleBypassed) {
+    BypassPatch = PreamblePatch::createBypassPatch(Input.FileName,
+                                                   Input.ParseInput,
+                                                   Input.Preamble);
+    BypassPatch->apply(*CI);
+  } else if (Input.Patch) {
     Input.Patch->apply(*CI);
+  }
+  const PrecompiledPreamble *PreamblePCH =
+      !CompletingInPreamble ? &Input.Preamble.Preamble : nullptr;
   applyRequiredModulesSettings(Input.Preamble.RequiredModules.get(), *CI);
   // NOTE: we must call BeginSourceFile after prepareCompilerInstance. Otherwise
   // the remapped buffers do not get freed.
@@ -1460,8 +1472,8 @@ bool semaCodeComplete(std::unique_ptr<CodeCompleteConsumer> Consumer,
   if (Input.Preamble.StatCache)
     VFS = Input.Preamble.StatCache->getConsumingFS(std::move(VFS));
   auto Clang = prepareCompilerInstance(
-      std::move(CI), !CompletingInPreamble ? &Input.Preamble.Preamble : nullptr,
-      std::move(ContentsBuffer), std::move(VFS), IgnoreDiags);
+      std::move(CI), PreamblePCH, std::move(ContentsBuffer), std::move(VFS),
+      IgnoreDiags);
   Clang->getPreprocessorOpts().SingleFileParseMode = CompletingInPreamble;
   Clang->setCodeCompletionConsumer(Consumer.release());
 

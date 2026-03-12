@@ -588,6 +588,13 @@ bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
   return Inputs.ModulesManager && NaturalBounds.Size != 0;
 }
 
+bool bypassedPreambleForModules(const ParseInputs &Inputs,
+                                const PreambleData &Preamble,
+                                PreambleBounds NaturalBounds) {
+  return Preamble.Preamble.getBounds().Size == 0 &&
+         shouldBypassPreambleForModules(Inputs, NaturalBounds);
+}
+
 std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
               const ParseInputs &Inputs, bool StoreInMemory,
@@ -832,6 +839,27 @@ PreamblePatch PreamblePatch::create(llvm::StringRef FileName,
     return PreamblePatch::unmodified(Baseline);
   }
 
+  if (PatchType == PatchType::BypassedModules) {
+    PreamblePatch PP;
+    PP.Baseline = &Baseline;
+    PP.PatchFileName = getPatchName(FileName);
+    PP.ModifiedBounds = ModifiedScan->Bounds;
+
+    llvm::raw_string_ostream Patch(PP.PatchContents);
+    Patch << "#line 0 \"";
+    escapeBackslashAndQuotes(FileName, Patch);
+    Patch << "\"\n";
+    Patch << "#line 1\n";
+    Patch << llvm::StringRef(Modified.Contents).take_front(
+        ModifiedScan->Bounds.Size);
+
+    PP.PatchedDiags = patchDiags(Baseline.Diags, *BaselineScan, *ModifiedScan);
+    PP.PatchedMarks = std::move(ModifiedScan->Marks);
+    PP.PatchedMacros = std::move(ModifiedScan->Macros);
+    dlog("Created preamble bypass patch: {0}", Patch.str());
+    return PP;
+  }
+
   bool IncludesChanged = BaselineScan->Includes != ModifiedScan->Includes;
   bool DirectivesChanged =
       BaselineScan->TextualDirectives != ModifiedScan->TextualDirectives;
@@ -935,6 +963,12 @@ PreamblePatch PreamblePatch::createMacroPatch(llvm::StringRef FileName,
                                               const ParseInputs &Modified,
                                               const PreambleData &Baseline) {
   return create(FileName, Modified, Baseline, PatchType::MacroDirectives);
+}
+
+PreamblePatch PreamblePatch::createBypassPatch(llvm::StringRef FileName,
+                                               const ParseInputs &Modified,
+                                               const PreambleData &Baseline) {
+  return create(FileName, Modified, Baseline, PatchType::BypassedModules);
 }
 
 void PreamblePatch::apply(CompilerInvocation &CI) const {

@@ -154,6 +154,12 @@ struct PreambleBuildStats {
 bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
                                     PreambleBounds NaturalBounds);
 
+/// Returns true when \p Preamble is the intentionally bypassed empty preamble
+/// used for modules-managed files with a naturally non-empty preamble.
+bool bypassedPreambleForModules(const ParseInputs &Inputs,
+                                const PreambleData &Preamble,
+                                PreambleBounds NaturalBounds);
+
 /// Build a preamble for the new inputs unless an old one can be reused.
 /// If \p PreambleCallback is set, it will be run on top of the AST while
 /// building the preamble.
@@ -179,7 +185,7 @@ bool isPreambleCompatible(const PreambleData &Preamble,
 /// new include directives.
 class PreamblePatch {
 public:
-  enum class PatchType { MacroDirectives, All };
+  enum class PatchType { MacroDirectives, All, BypassedModules };
   /// \p Preamble is used verbatim.
   static PreamblePatch unmodified(const PreambleData &Preamble);
   /// Builds a patch that contains new PP directives introduced to the preamble
@@ -192,6 +198,9 @@ public:
   static PreamblePatch createMacroPatch(llvm::StringRef FileName,
                                         const ParseInputs &Modified,
                                         const PreambleData &Baseline);
+  static PreamblePatch createBypassPatch(llvm::StringRef FileName,
+                                         const ParseInputs &Modified,
+                                         const PreambleData &Baseline);
   /// Returns the FileEntry for the preamble patch of MainFilePath in SM, if
   /// any.
   static OptionalFileEntryRef getPatchEntry(llvm::StringRef MainFilePath,
