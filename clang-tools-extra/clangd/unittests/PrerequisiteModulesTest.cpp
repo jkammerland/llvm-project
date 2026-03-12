@@ -1775,6 +1775,56 @@ export inline int useGMF() { return GMFValue; }
       ParseWithSetup(&BypassPatch, &Preamble->Preamble)));
 }
 
+TEST_F(PrerequisiteModulesTests,
+       ModulesBypassPatchPreservesGMFMetadataSideTables) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+module;
+#define GMF_MACRO 1
+#if 0
+int skipped_in_gmf;
+#endif
+#pragma mark In GMF
+export module M;
+#define BODY_MACRO 2
+#if 0
+int skipped_in_body;
+#endif
+#pragma mark In Body
+export inline int value() { return BODY_MACRO; }
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto AST = ParsedAST::build(getFullPath("M.cppm"), Input, std::move(CI), {},
+                              Preamble);
+  ASSERT_TRUE(AST);
+  EXPECT_TRUE(AST->bypassedPreambleForModules());
+
+  EXPECT_THAT(AST->getMacros().Names.keys(),
+              testing::UnorderedElementsAre("GMF_MACRO", "BODY_MACRO"));
+  EXPECT_THAT(AST->getMacros().SkippedRanges, testing::SizeIs(2));
+
+  std::vector<std::string> MarkTrivia;
+  for (const auto &Mark : AST->getMarks())
+    MarkTrivia.push_back(Mark.Trivia);
+  EXPECT_THAT(MarkTrivia,
+              testing::ElementsAre(" In GMF", " In Body"));
+}
+
 TEST_F(PrerequisiteModulesTests, ModuleDeclNotAtStartStillReportedWithoutGMF) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 

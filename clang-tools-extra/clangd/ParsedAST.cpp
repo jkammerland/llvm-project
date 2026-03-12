@@ -696,8 +696,13 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // with non-preamble macros below.
   MainFileMacros Macros;
   std::vector<PragmaMark> Marks;
-  if (Patch && !ModulesPreambleBypassed) {
+  if (Patch) {
     Macros = Patch->mainFileMacros();
+    // Pragma marks from the bypass patch are already observed via live
+    // callbacks, but macro definitions and skipped ranges in the helper patch
+    // file are not treated as main-file content and must be seeded here.
+  }
+  if (Patch && !ModulesPreambleBypassed) {
     Marks = Patch->marks();
   }
   auto &PP = Clang->getPreprocessor();
