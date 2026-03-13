@@ -160,6 +160,17 @@ bool bypassedPreambleForModules(const ParseInputs &Inputs,
                                 const PreambleData &Preamble,
                                 PreambleBounds NaturalBounds);
 
+/// Returns true when the modules-bypass patch should be injected into the
+/// compiler invocation for a naturally non-empty preamble.
+///
+/// Named module interface units with a GMF cannot replay the bypass patch as a
+/// synthetic include, because that makes the leading module declaration appear
+/// to come from a header. Callers may still use the patch side tables without
+/// applying it to the compiler invocation.
+bool shouldApplyBypassPatchForModules(const ParseInputs &Inputs,
+                                      const LangOptions &LangOpts,
+                                      PreambleBounds NaturalBounds);
+
 /// Build a preamble for the new inputs unless an old one can be reused.
 /// If \p PreambleCallback is set, it will be run on top of the AST while
 /// building the preamble.

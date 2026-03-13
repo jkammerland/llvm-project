@@ -595,6 +595,37 @@ bool bypassedPreambleForModules(const ParseInputs &Inputs,
          shouldBypassPreambleForModules(Inputs, NaturalBounds);
 }
 
+static bool startsNamedModuleInterfaceAfterPreamble(llvm::StringRef Contents,
+                                                    const LangOptions &LangOpts,
+                                                    PreambleBounds Bounds) {
+  if (Bounds.Size >= Contents.size())
+    return false;
+
+  llvm::StringRef Suffix = Contents.drop_front(Bounds.Size);
+  SourceLocation Start;
+  Lexer Lex(Start, LangOpts, Suffix.begin(), Suffix.begin(), Suffix.end());
+  Lex.SetKeepWhitespaceMode(false);
+  Lex.SetCommentRetentionState(false);
+
+  Token Tok;
+  if (Lex.LexFromRawLexer(Tok))
+    return false;
+  if (!Tok.is(tok::raw_identifier) || Tok.getRawIdentifier() != "export")
+    return false;
+  if (Lex.LexFromRawLexer(Tok))
+    return false;
+  return Tok.is(tok::raw_identifier) && Tok.getRawIdentifier() == "module";
+}
+
+bool shouldApplyBypassPatchForModules(const ParseInputs &Inputs,
+                                      const LangOptions &LangOpts,
+                                      PreambleBounds NaturalBounds) {
+  if (!shouldBypassPreambleForModules(Inputs, NaturalBounds))
+    return false;
+  return !startsNamedModuleInterfaceAfterPreamble(Inputs.Contents, LangOpts,
+                                                  NaturalBounds);
+}
+
 std::shared_ptr<const PreambleData>
 buildPreamble(PathRef FileName, CompilerInvocation CI,
               const ParseInputs &Inputs, bool StoreInMemory,
@@ -853,6 +884,7 @@ PreamblePatch PreamblePatch::create(llvm::StringRef FileName,
     Patch << llvm::StringRef(Modified.Contents).take_front(
         ModifiedScan->Bounds.Size);
 
+    PP.PreambleIncludes = std::move(ModifiedScan->Includes);
     PP.PatchedDiags = patchDiags(Baseline.Diags, *BaselineScan, *ModifiedScan);
     PP.PatchedMarks = std::move(ModifiedScan->Marks);
     PP.PatchedMacros = std::move(ModifiedScan->Macros);

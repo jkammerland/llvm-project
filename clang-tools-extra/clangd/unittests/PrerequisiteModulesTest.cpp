@@ -1825,6 +1825,166 @@ export inline int value() { return BODY_MACRO; }
               testing::ElementsAre(" In GMF", " In Body"));
 }
 
+TEST_F(PrerequisiteModulesTests, ModulesBypassPatchFailsForInterfaceUnitGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+// Module partition interface unit for algebra operations
+module;
+
+// Global module fragment - includes must go here
+#include <cmath>
+#include <stdexcept>
+
+export module M;
+export inline double value() { return std::sqrt(4.0); }
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Input.Contents, getFullPath("M.cppm")), 0);
+  auto Preamble =
+      buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_TRUE(
+      bypassedPreambleForModules(Input, *Preamble, NaturalPreambleBounds));
+
+  auto BypassPatch =
+      PreamblePatch::createBypassPatch(getFullPath("M.cppm"), Input, *Preamble);
+
+  auto ParseWithSetup = [&](const PreamblePatch *Patch,
+                            const PrecompiledPreamble *PreamblePCH) {
+    StoreDiags RawDiags;
+    auto ParseCI = buildCompilerInvocation(Input, RawDiags);
+    EXPECT_TRUE(ParseCI);
+    if (!ParseCI)
+      return std::vector<Diag>{};
+
+    applyRequiredModulesSettings(Preamble->RequiredModules.get(), *ParseCI);
+    if (Patch)
+      Patch->apply(*ParseCI);
+
+    auto Clang = prepareCompilerInstance(
+        std::move(ParseCI), PreamblePCH,
+        llvm::MemoryBuffer::getMemBufferCopy(Input.Contents,
+                                             getFullPath("M.cppm")),
+        Input.TFS->view(Input.CompileCommand.Directory), RawDiags);
+    EXPECT_TRUE(Clang);
+    if (!Clang)
+      return std::vector<Diag>{};
+
+    SyntaxOnlyAction Action;
+    EXPECT_TRUE(
+        Action.BeginSourceFile(*Clang, Clang->getFrontendOpts().Inputs[0]));
+    if (llvm::Error Err = Action.Execute())
+      ADD_FAILURE() << llvm::toString(std::move(Err));
+    Action.EndSourceFile();
+    return RawDiags.take();
+  };
+
+  auto SawDiag = [](llvm::ArrayRef<Diag> Diags, llvm::StringRef Name) {
+    for (const auto &Diag : Diags) {
+      if (Diag.Name == Name)
+        return true;
+    }
+    return false;
+  };
+
+  auto BypassWithPreamble = ParseWithSetup(&BypassPatch, &Preamble->Preamble);
+  auto NoPatchWithPreamble = ParseWithSetup(nullptr, &Preamble->Preamble);
+  auto NoPatchNoPreamble = ParseWithSetup(nullptr, nullptr);
+
+  EXPECT_TRUE(SawDiag(BypassWithPreamble, "pp_module_decl_in_header"));
+  EXPECT_FALSE(SawDiag(NoPatchWithPreamble, "pp_module_decl_in_header"));
+  EXPECT_FALSE(SawDiag(NoPatchNoPreamble, "pp_module_decl_in_header"));
+}
+
+TEST_F(PrerequisiteModulesTests, NoFalseModuleDeclInHeaderWithInterfaceUnitGMF) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+// Module partition interface unit for algebra operations
+module;
+
+// Global module fragment - includes must go here
+#include <cmath>
+#include <stdexcept>
+
+export module M;
+export inline double value() { return std::sqrt(4.0); }
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto AST = ParsedAST::build(getFullPath("M.cppm"), Input, std::move(CI), {},
+                              Preamble);
+  ASSERT_TRUE(AST);
+  EXPECT_TRUE(AST->bypassedPreambleForModules());
+
+  for (const auto &Diag : AST->getDiagnostics())
+    EXPECT_NE(Diag.Name, "pp_module_decl_in_header");
+}
+
+TEST_F(PrerequisiteModulesTests,
+       InterfaceUnitBypassPreservesGMFIncludesInAST) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+inline int gmfHelper() { return 1; }
+  )cpp");
+
+  CDB.addFile("M.cppm", R"cpp(
+module;
+#include "gmf.hpp"
+export module M;
+export inline int value() { return gmfHelper(); }
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto AST = ParsedAST::build(getFullPath("M.cppm"), Input, std::move(CI), {},
+                              Preamble);
+  ASSERT_TRUE(AST);
+  EXPECT_TRUE(AST->bypassedPreambleForModules());
+  EXPECT_THAT(AST->getIncludeStructure().MainFileIncludes,
+              testing::ElementsAre(
+                  testing::Field(&Inclusion::Written, "\"gmf.hpp\"")));
+}
+
 TEST_F(PrerequisiteModulesTests, ModuleDeclNotAtStartStillReportedWithoutGMF) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
@@ -1947,6 +2107,46 @@ void func() {
   ASSERT_TRUE(PrintA->Documentation);
   EXPECT_THAT(PrintA->Documentation->asPlainText(),
               testing::HasSubstr("Print A value."));
+}
+
+TEST_F(PrerequisiteModulesTests,
+       InterfaceUnitCodeCompletePreservesGMFIncludes) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("gmf.hpp", R"cpp(
+inline int gmfHelper() { return 1; }
+  )cpp");
+
+  llvm::StringLiteral Contents = R"cpp(
+module;
+#include "gmf.hpp"
+export module M;
+export inline int value() {
+  return gmf^
+}
+  )cpp";
+  CDB.addFile("M.cppm", Contents);
+  Annotations Test(Contents);
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Input = getInputs("M.cppm", CDB);
+  Input.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Input, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+
+  auto Result = codeComplete(getFullPath("M.cppm"), Test.point(),
+                             Preamble.get(), Input, {});
+  EXPECT_THAT(Result.Completions,
+              testing::Contains(
+                  testing::Field(&CodeCompletion::Name, "gmfHelper")));
 }
 
 TEST_F(PrerequisiteModulesTests, CodeCompleteModuleDocsFromPrebuiltNamedModule) {

@@ -456,10 +456,15 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   const bool ModulesPreambleBypassed =
       Preamble && clangd::bypassedPreambleForModules(Inputs, *Preamble,
                                                      NaturalPreambleBounds);
+  const bool ApplyModulesBypassPatch =
+      ModulesPreambleBypassed &&
+      shouldApplyBypassPatchForModules(Inputs, CI->getLangOpts(),
+                                       NaturalPreambleBounds);
   const PrecompiledPreamble *PreamblePCH =
       Preamble ? &Preamble->Preamble : nullptr;
 
   std::optional<PreamblePatch> Patch;
+  bool PatchApplied = false;
   // We might use an ignoring diagnostic consumer if they are going to be
   // dropped later on to not pay for extra latency by processing them.
   DiagnosticConsumer *DiagConsumer = &ASTDiags;
@@ -468,7 +473,10 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     Patch = ModulesPreambleBypassed
                 ? PreamblePatch::createBypassPatch(Filename, Inputs, *Preamble)
                 : PreamblePatch::createFullPatch(Filename, Inputs, *Preamble);
-    Patch->apply(*CI);
+    if (!ModulesPreambleBypassed || ApplyModulesBypassPatch) {
+      Patch->apply(*CI);
+      PatchApplied = true;
+    }
   }
   auto Clang = prepareCompilerInstance(
       std::move(CI), PreamblePCH,
@@ -674,11 +682,13 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
 
   IncludeStructure Includes;
   include_cleaner::PragmaIncludes PI;
+  const bool NeedPatchSideTables =
+      Patch && (!ModulesPreambleBypassed || !PatchApplied);
   // If we are using a preamble, copy existing includes.
   if (Preamble) {
     Includes = Preamble->Includes;
     PI = *Preamble->Pragmas;
-    if (Patch && !ModulesPreambleBypassed) {
+    if (NeedPatchSideTables) {
       Includes.MainFileIncludes = Patch->preambleIncludes();
       // Replay the preamble includes so that clang-tidy checks can see them.
       ReplayPreamble::attach(Patch->preambleIncludes(), *Clang,
@@ -702,7 +712,7 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     // callbacks, but macro definitions and skipped ranges in the helper patch
     // file are not treated as main-file content and must be seeded here.
   }
-  if (Patch && !ModulesPreambleBypassed) {
+  if (NeedPatchSideTables) {
     Marks = Patch->marks();
   }
   auto &PP = Clang->getPreprocessor();
@@ -763,7 +773,7 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // FIXME: Also skip generation of diagnostics altogether to speed up ast
   // builds when we are patching a stale preamble.
   // Add diagnostics from the preamble, if any.
-  if (Patch && !ModulesPreambleBypassed)
+  if (NeedPatchSideTables)
     llvm::append_range(Diags, Patch->patchedDiags());
   // Finally, add diagnostics coming from the AST.
   {
