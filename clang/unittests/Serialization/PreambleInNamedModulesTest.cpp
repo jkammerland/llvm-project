@@ -125,4 +125,72 @@ export using ::E;
   EXPECT_FALSE(Clang->getDiagnosticsPtr()->hasErrorOccurred());
 }
 
+TEST_F(PreambleInNamedModulesTest, ZeroLengthPreambleKeepsGMFInMainFile) {
+  addFile("foo.h", R"cpp(
+inline int helper() { return 1; }
+  )cpp");
+
+  PathType MainFilePath;
+  addFile("A.cppm", R"cpp(
+module;
+#include "foo.h"
+export module A;
+export inline int value() { return helper(); }
+  )cpp",
+          MainFilePath);
+
+  IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS =
+      llvm::vfs::createPhysicalFileSystem();
+  DiagnosticOptions DiagOpts;
+  IntrusiveRefCntPtr<DiagnosticsEngine> Diags =
+      CompilerInstance::createDiagnostics(*VFS, DiagOpts);
+
+  CreateInvocationOptions CIOpts;
+  CIOpts.Diags = Diags;
+  CIOpts.VFS = VFS;
+
+  const char *Args[] = {"clang++", "-std=c++20", "-working-directory",
+                        TestDir.c_str(), MainFilePath.c_str()};
+  std::shared_ptr<CompilerInvocation> Invocation =
+      createInvocation(Args, CIOpts);
+  ASSERT_TRUE(Invocation);
+
+  llvm::ErrorOr<std::unique_ptr<MemoryBuffer>> ContentsBuffer =
+      llvm::MemoryBuffer::getFile(MainFilePath, /*IsText=*/true);
+  EXPECT_TRUE(ContentsBuffer);
+  std::unique_ptr<MemoryBuffer> Buffer = std::move(*ContentsBuffer);
+
+  PreambleBounds NaturalBounds =
+      ComputePreambleBounds(Invocation->getLangOpts(), *Buffer, 0);
+  ASSERT_GT(NaturalBounds.Size, 0u);
+
+  PreambleCallbacks Callbacks;
+  llvm::ErrorOr<PrecompiledPreamble> BuiltPreamble = PrecompiledPreamble::Build(
+      *Invocation, Buffer.get(),
+      {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true}, Diags, VFS,
+      std::make_shared<PCHContainerOperations>(),
+      /*StoreInMemory=*/false, /*StoragePath=*/TestDir, Callbacks);
+
+  ASSERT_FALSE(Diags->hasErrorOccurred());
+  ASSERT_TRUE(BuiltPreamble);
+  EXPECT_EQ(BuiltPreamble->getBounds().Size, 0u);
+  EXPECT_TRUE(BuiltPreamble->CanReuse(
+      *Invocation, *Buffer,
+      {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true}, *VFS));
+
+  BuiltPreamble->OverridePreamble(*Invocation, VFS, Buffer.get());
+
+  auto Clang = std::make_unique<CompilerInstance>(std::move(Invocation));
+  Clang->setDiagnostics(Diags);
+  Clang->createVirtualFileSystem(VFS);
+  Clang->createFileManager();
+  EXPECT_TRUE(Clang->createTarget());
+
+  Buffer.release();
+
+  SyntaxOnlyAction Action;
+  EXPECT_TRUE(Clang->ExecuteAction(Action));
+  EXPECT_FALSE(Clang->getDiagnosticsPtr()->hasErrorOccurred());
+}
+
 } // namespace

@@ -715,7 +715,14 @@ void PrecompiledPreamble::AddImplicitPreamble(
 void PrecompiledPreamble::OverridePreamble(
     CompilerInvocation &CI, IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
     llvm::MemoryBuffer *MainFileBuffer) const {
-  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *MainFileBuffer, 0);
+  // Some clients intentionally build an empty preamble even when the file has
+  // a natural preamble region. Recomputing natural bounds here would make
+  // clang treat leading main-file tokens as if they came from the preamble/PCH
+  // despite the stored preamble containing zero bytes.
+  auto Bounds = PreambleBytes.empty()
+                    ? getBounds()
+                    : ComputePreambleBounds(CI.getLangOpts(), *MainFileBuffer,
+                                            0);
   configurePreamble(Bounds, CI, VFS, MainFileBuffer);
 }
 
