@@ -644,7 +644,8 @@ private:
     // Revalidate the BMI against the prerequisite prefix that existed when it
     // was originally built, not the whole final reusable set.
     StaticPrerequisiteModules BuiltBeforeCurrent(
-        llvm::ArrayRef(RequiredModules).take_front(Index));
+        llvm::ArrayRef<std::shared_ptr<const ModuleFile>>(RequiredModules)
+            .take_front(Index));
     return IsModuleFileUpToDate(MF.getModuleFilePath(), BuiltBeforeCurrent, VFS,
                                 ValidationCI.get());
   }
