@@ -32,10 +32,12 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TokenKinds.h"
+#include "clang/DependencyScanning/DependencyScanningService.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/PrecompiledPreamble.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -43,6 +45,7 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "clang/Tooling/DependencyScanningTool.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
@@ -585,25 +588,42 @@ static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
 static bool lexicallyLooksLikeModulesManagedText(llvm::StringRef Contents) {
   if (Contents.empty())
     return false;
-  llvm::SmallVector<llvm::StringRef, 32> Lines;
-  Contents.split(Lines, '\n');
-  for (llvm::StringRef Line : Lines) {
-    llvm::StringRef Trimmed = Line.ltrim();
-    if (Trimmed.empty())
+
+  auto Buffer = llvm::MemoryBuffer::getMemBufferCopy(Contents);
+  SourceLocation Start;
+  LangOptions LexLangOpts;
+  llvm::StringRef StableContents = Buffer->getBuffer();
+  Lexer Lex(Start, LexLangOpts, StableContents.begin(), StableContents.begin(),
+            StableContents.end());
+  Lex.SetKeepWhitespaceMode(false);
+  Lex.SetCommentRetentionState(false);
+
+  Token Tok;
+  while (!Lex.LexFromRawLexer(Tok)) {
+    if (!Tok.is(tok::raw_identifier))
       continue;
-    if (Trimmed.starts_with("//") || Trimmed.starts_with("/*") ||
-        Trimmed.starts_with("*"))
-      continue;
-    if (Trimmed.starts_with("import"))
+
+    llvm::StringRef Identifier = Tok.getRawIdentifier();
+    if (Tok.isAtStartOfLine() && Identifier == "import")
       return true;
-    if (Trimmed.consume_front("module")) {
-      Trimmed = Trimmed.ltrim();
-      if (!Trimmed.starts_with(";"))
+
+    if (!Tok.isAtStartOfLine())
+      continue;
+
+    if (Identifier == "module") {
+      Token Next;
+      if (!Lex.LexFromRawLexer(Next) && !Next.is(tok::semi))
         return true;
       continue;
     }
-    if (Trimmed.starts_with("export module") ||
-        Trimmed.starts_with("export import"))
+
+    if (Identifier != "export")
+      continue;
+
+    Token Next;
+    if (!Lex.LexFromRawLexer(Next) && Next.is(tok::raw_identifier) &&
+        (Next.getRawIdentifier() == "module" ||
+         Next.getRawIdentifier() == "import"))
       return true;
   }
 
@@ -712,6 +732,34 @@ parseIncludeDirective(llvm::StringRef Line) {
   return Include;
 }
 
+static bool containsNonLiteralIncludeDirective(
+    llvm::StringRef Contents,
+    std::optional<PreambleBounds> Bounds = std::nullopt) {
+  if (Bounds)
+    Contents =
+        Contents.take_front(std::min<size_t>(Bounds->Size, Contents.size()));
+
+  llvm::SmallVector<llvm::StringRef, 32> Lines;
+  Contents.split(Lines, '\n');
+  for (llvm::StringRef Line : Lines) {
+    llvm::StringRef Rest = Line.ltrim();
+    if (!Rest.consume_front("#"))
+      continue;
+    Rest = Rest.ltrim();
+    if (!(Rest.consume_front("include_next") || Rest.consume_front("include") ||
+          Rest.consume_front("import")))
+      continue;
+    if (!Rest.empty() && !llvm::isSpace(Rest.front()))
+      continue;
+    Rest = Rest.ltrim();
+    if (Rest.empty())
+      continue;
+    if (Rest.front() != '"' && Rest.front() != '<')
+      return true;
+  }
+  return false;
+}
+
 static llvm::SmallVector<ParsedIncludeDirective, 8>
 collectSpelledIncludes(llvm::StringRef Contents,
                        std::optional<PreambleBounds> Bounds = std::nullopt) {
@@ -757,10 +805,14 @@ resolveInclude(const ParsedIncludeDirective &Include, llvm::StringRef Including,
   return std::nullopt;
 }
 
-static bool preambleIncludesLexicallyLookModular(const ParseInputs &Inputs,
-                                                 PreambleBounds NaturalBounds) {
+static bool preambleIncludesLexicallyLookModular(
+    const ParseInputs &Inputs, PreambleBounds NaturalBounds,
+    bool *NeedsDependencyScanFallback = nullptr) {
   if (!Inputs.TFS || Inputs.CompileCommand.Filename.empty())
     return false;
+
+  if (NeedsDependencyScanFallback)
+    *NeedsDependencyScanFallback = false;
 
   llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS =
       Inputs.TFS->view(Inputs.CompileCommand.Directory);
@@ -784,6 +836,10 @@ static bool preambleIncludesLexicallyLookModular(const ParseInputs &Inputs,
         }
       };
 
+  if (NeedsDependencyScanFallback &&
+      containsNonLiteralIncludeDirective(Inputs.Contents, NaturalBounds))
+    *NeedsDependencyScanFallback = true;
+
   EnqueueIncludes(collectSpelledIncludes(Inputs.Contents, NaturalBounds),
                   MainFile);
 
@@ -795,12 +851,47 @@ static bool preambleIncludesLexicallyLookModular(const ParseInputs &Inputs,
       continue;
 
     llvm::StringRef Contents = (*Buffer)->getBuffer();
+    if (NeedsDependencyScanFallback &&
+        containsNonLiteralIncludeDirective(Contents))
+      *NeedsDependencyScanFallback = true;
     if (lexicallyLooksLikeModulesManagedText(Contents))
       return true;
 
     EnqueueIncludes(collectSpelledIncludes(Contents), Current);
   }
   return false;
+}
+
+static std::optional<bool>
+dependencyScanShowsNamedModules(const ParseInputs &Inputs) {
+  if (!Inputs.TFS)
+    return std::nullopt;
+
+  dependencies::DependencyScanningServiceOptions Opts;
+  Opts.MakeVFS = [&] { return Inputs.TFS->view(std::nullopt); };
+  Opts.Mode = dependencies::ScanningMode::CanonicalPreprocessing;
+  Opts.Format = dependencies::ScanningOutputFormat::P1689;
+  dependencies::DependencyScanningService Service(Opts);
+
+  tooling::DependencyScanningTool ScanningTool(Service);
+  std::string ScanDiags;
+  llvm::raw_string_ostream DiagOS(ScanDiags);
+  DiagnosticOptions DiagOpts;
+  DiagOpts.ShowCarets = false;
+  TextDiagnosticPrinter DiagConsumer(DiagOS, DiagOpts);
+
+  std::optional<tooling::P1689Rule> ScanResult =
+      ScanningTool.getP1689ModuleDependencyFile(Inputs.CompileCommand,
+                                                Inputs.CompileCommand.Directory,
+                                                DiagConsumer);
+  if (!ScanResult) {
+    vlog("Skipping modules preamble bypass after failed dependency scan for "
+         "{0}: {1}",
+         Inputs.CompileCommand.Filename, llvm::StringRef(ScanDiags).trim());
+    return std::nullopt;
+  }
+
+  return ScanResult->Provides || !ScanResult->Requires.empty();
 }
 
 bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
@@ -811,7 +902,16 @@ bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
   if (preambleRegionLexicallyLooksModular(Inputs.Contents, NaturalBounds))
     return true;
 
-  return preambleIncludesLexicallyLookModular(Inputs, NaturalBounds);
+  bool NeedsDependencyScanFallback = false;
+  if (preambleIncludesLexicallyLookModular(Inputs, NaturalBounds,
+                                           &NeedsDependencyScanFallback))
+    return true;
+
+  if (NeedsDependencyScanFallback)
+    if (auto UsesNamedModules = dependencyScanShowsNamedModules(Inputs))
+      return *UsesNamedModules;
+
+  return false;
 }
 
 bool bypassedPreambleForModules(const ParseInputs &Inputs,

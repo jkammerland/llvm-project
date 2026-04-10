@@ -1422,6 +1422,38 @@ void foo() {
 }
 
 TEST_F(PrerequisiteModulesTests,
+       CommentSeparatedExportImportHeaderStillBypasses) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("TokenImport.hpp", R"cpp(
+export /*comment*/ import A;
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+#include "TokenImport.hpp"
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+void foo() {}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Use.Contents, getFullPath("Use.cpp")), 0);
+  ASSERT_GT(NaturalPreambleBounds.Size, 0u);
+
+  EXPECT_TRUE(shouldBypassPreambleForModules(Use, NaturalPreambleBounds));
+}
+
+TEST_F(PrerequisiteModulesTests,
        NonModularHeadersKeepNaturalBoundsAfterDependencyScanFailure) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
@@ -1505,6 +1537,50 @@ export void printA();
   )cpp");
   CDB.addFile("Header.hpp", R"cpp(
 import A;
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+void foo() {
+  printA();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+
+  auto AST = ParsedAST::build(getFullPath("Use.cpp"), Use, std::move(CI), {},
+                              Preamble);
+  ASSERT_TRUE(AST);
+
+  const NamedDecl &D = findDecl(*AST, "printA");
+  EXPECT_TRUE(D.isFromASTFile());
+}
+
+TEST_F(PrerequisiteModulesTests, MacroIncludeDrivenImportInMainAST) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+export void printA();
+  )cpp");
+  CDB.addFile("Import.hpp", R"cpp(
+import A;
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+#define CLANGD_IMPORT_HEADER "Import.hpp"
+#include CLANGD_IMPORT_HEADER
   )cpp");
   CDB.addFile("Use.cpp", R"cpp(
 #include "Header.hpp"
