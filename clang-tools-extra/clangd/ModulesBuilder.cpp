@@ -14,13 +14,17 @@
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ModuleCache.h"
-#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 
 #include <optional>
 #include <queue>
+#include <tuple>
 
 namespace clang {
 namespace clangd {
@@ -33,44 +37,56 @@ llvm::cl::opt<bool> DebugModulesBuilder(
                    "Remember to remove them later after debugging."),
     llvm::cl::init(false));
 
-// Create a path to store module files. Generally it should be:
-//
-//   {TEMP_DIRS}/clangd/module_files/{hashed-file-name}-%%-%%-%%-%%-%%-%%/.
-//
-// {TEMP_DIRS} is the temporary directory for the system, e.g., "/var/tmp"
-// or "C:/TEMP".
-//
-// '%%' means random value to make the generated path unique.
-//
-// \param MainFile is used to get the root of the project from global
-// compilation database.
-//
-// TODO: Move these module fils out of the temporary directory if the module
-// files are persistent.
-llvm::SmallString<256> getUniqueModuleFilesPath(PathRef MainFile) {
-  llvm::SmallString<128> HashedPrefix = llvm::sys::path::filename(MainFile);
-  // There might be multiple files with the same name in a project. So appending
-  // the hash value of the full path to make sure they won't conflict.
-  HashedPrefix += std::to_string(llvm::hash_value(MainFile));
+struct ModuleInputStamp {
+  std::string Path;
+  uint64_t StoredSize = 0;
+  int64_t StoredTime = 0;
+  uint64_t ContentHash = 0;
+};
 
-  llvm::SmallString<256> ResultPattern;
+struct ModuleImportStamp {
+  std::string ModuleName;
+  std::string Path;
+  uint64_t ContentHash = 0;
+};
 
-  llvm::sys::path::system_temp_directory(/*erasedOnReboot=*/true,
-                                         ResultPattern);
+struct ModuleInputManifest {
+  uint64_t ModuleFileHash = 0;
+  std::vector<ModuleInputStamp> Inputs;
+  std::vector<ModuleImportStamp> Imports;
+};
 
-  llvm::sys::path::append(ResultPattern, "clangd");
-  llvm::sys::path::append(ResultPattern, "module_files");
+llvm::SmallString<256> getModuleCacheRoot() {
+  llvm::SmallString<256> Root;
+  if (llvm::sys::path::cache_directory(Root))
+    llvm::sys::path::append(Root, "clangd");
+  else
+    llvm::sys::path::system_temp_directory(/*erasedOnReboot=*/false, Root);
+  llvm::sys::path::append(Root, "module_files");
+  llvm::sys::fs::create_directories(Root);
+  return Root;
+}
 
-  llvm::sys::path::append(ResultPattern, HashedPrefix);
+llvm::SmallString<256>
+getStableModuleFilesPath(PathRef ModuleUnitFileName,
+                         llvm::StringRef StableModuleVariantFingerprint) {
+  llvm::SmallString<256> Result = getModuleCacheRoot();
+  llvm::SmallString<128> StablePrefix =
+      llvm::sys::path::filename(ModuleUnitFileName);
+  StablePrefix.push_back('-');
+  StablePrefix.append(StableModuleVariantFingerprint);
+  llvm::sys::path::append(Result, StablePrefix);
+  return Result;
+}
 
-  ResultPattern.append("-%%-%%-%%-%%-%%-%%");
-
+std::string getTemporaryModuleFilesPath(PathRef StableModuleFilesPath) {
+  llvm::SmallString<256> ResultPattern(StableModuleFilesPath);
+  ResultPattern.append(".tmp-%%%%%%");
   llvm::SmallString<256> Result;
   llvm::sys::fs::createUniquePath(ResultPattern, Result,
                                   /*MakeAbsolute=*/false);
-
   llvm::sys::fs::create_directories(Result);
-  return Result;
+  return Result.str().str();
 }
 
 // Get a unique module file path under \param ModuleFilesPrefix.
@@ -90,6 +106,10 @@ std::string getModuleFilePath(llvm::StringRef ModuleName,
 
 std::string getModuleContextHashFilePath(PathRef ModuleFilePath) {
   return (ModuleFilePath + ".ctxhash").str();
+}
+
+std::string getModuleInputManifestFilePath(PathRef ModuleFilePath) {
+  return (ModuleFilePath + ".inputs.json").str();
 }
 
 void writeModuleContextHashFile(PathRef ModuleFilePath,
@@ -112,6 +132,138 @@ readModuleContextHashFile(PathRef ModuleFilePath,
   if (!Buffer)
     return std::nullopt;
   return llvm::StringRef(Buffer.get()->getBuffer()).trim().str();
+}
+
+void writeModuleInputManifestFile(PathRef ModuleFilePath,
+                                  const ModuleInputManifest &Manifest) {
+  llvm::json::Array InputArray;
+  for (const auto &Input : Manifest.Inputs) {
+    llvm::json::Object Entry;
+    Entry["path"] = Input.Path;
+    Entry["size"] = static_cast<int64_t>(Input.StoredSize);
+    Entry["mtime"] = Input.StoredTime;
+    Entry["hash"] = llvm::utohexstr(Input.ContentHash);
+    InputArray.push_back(std::move(Entry));
+  }
+
+  llvm::json::Array ImportArray;
+  for (const auto &Import : Manifest.Imports) {
+    llvm::json::Object Entry;
+    Entry["module"] = Import.ModuleName;
+    Entry["path"] = Import.Path;
+    Entry["hash"] = llvm::utohexstr(Import.ContentHash);
+    ImportArray.push_back(std::move(Entry));
+  }
+
+  llvm::json::Object Root;
+  Root["module_hash"] = llvm::utohexstr(Manifest.ModuleFileHash);
+  Root["inputs"] = std::move(InputArray);
+  Root["imports"] = std::move(ImportArray);
+
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(getModuleInputManifestFilePath(ModuleFilePath), EC);
+  if (EC) {
+    vlog("Failed to write module input manifest for {0}: {1}", ModuleFilePath,
+         EC.message());
+    return;
+  }
+  OS << llvm::formatv("{0:2}", llvm::json::Value(std::move(Root)));
+}
+
+std::optional<ModuleInputManifest>
+readModuleInputManifestFile(PathRef ModuleFilePath,
+                            llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  auto Buffer =
+      VFS->getBufferForFile(getModuleInputManifestFilePath(ModuleFilePath));
+  if (!Buffer)
+    return std::nullopt;
+
+  llvm::Expected<llvm::json::Value> Parsed =
+      llvm::json::parse(Buffer.get()->getBuffer());
+  if (!Parsed) {
+    llvm::consumeError(Parsed.takeError());
+    return std::nullopt;
+  }
+
+  const auto *Root = Parsed->getAsObject();
+  if (!Root)
+    return std::nullopt;
+  std::optional<llvm::StringRef> ModuleHash = Root->getString("module_hash");
+  const auto *InputArray = Root->getArray("inputs");
+  if (!ModuleHash || !InputArray)
+    return std::nullopt;
+  const auto *ImportArray = Root->getArray("imports");
+
+  ModuleInputManifest Manifest;
+  if (ModuleHash->getAsInteger(16, Manifest.ModuleFileHash))
+    return std::nullopt;
+
+  Manifest.Inputs.reserve(InputArray->size());
+  for (const auto &EntryValue : *InputArray) {
+    const auto *Entry = EntryValue.getAsObject();
+    if (!Entry)
+      return std::nullopt;
+
+    ModuleInputStamp Input;
+    std::optional<llvm::StringRef> Path = Entry->getString("path");
+    std::optional<int64_t> Size = Entry->getInteger("size");
+    std::optional<int64_t> Time = Entry->getInteger("mtime");
+    std::optional<llvm::StringRef> Hash = Entry->getString("hash");
+    if (!Path || !Size || !Time || !Hash)
+      return std::nullopt;
+
+    uint64_t ParsedHash = 0;
+    if (Hash->getAsInteger(16, ParsedHash))
+      return std::nullopt;
+
+    Input.Path = Path->str();
+    Input.StoredSize = static_cast<uint64_t>(*Size);
+    Input.StoredTime = *Time;
+    Input.ContentHash = ParsedHash;
+    Manifest.Inputs.push_back(std::move(Input));
+  }
+
+  if (ImportArray) {
+    Manifest.Imports.reserve(ImportArray->size());
+    for (const auto &EntryValue : *ImportArray) {
+      const auto *Entry = EntryValue.getAsObject();
+      if (!Entry)
+        return std::nullopt;
+
+      ModuleImportStamp Import;
+      std::optional<llvm::StringRef> Module = Entry->getString("module");
+      std::optional<llvm::StringRef> Path = Entry->getString("path");
+      std::optional<llvm::StringRef> Hash = Entry->getString("hash");
+      if (!Module || !Path || !Hash)
+        return std::nullopt;
+
+      uint64_t ParsedHash = 0;
+      if (Hash->getAsInteger(16, ParsedHash))
+        return std::nullopt;
+
+      Import.ModuleName = Module->str();
+      Import.Path = Path->str();
+      Import.ContentHash = ParsedHash;
+      Manifest.Imports.push_back(std::move(Import));
+    }
+  }
+  return Manifest;
+}
+
+void removeModuleArtifacts(PathRef ModuleFilePath) {
+  llvm::sys::fs::remove(ModuleFilePath);
+  llvm::sys::fs::remove(getModuleContextHashFilePath(ModuleFilePath));
+  llvm::sys::fs::remove(getModuleInputManifestFilePath(ModuleFilePath));
+  llvm::sys::fs::remove(llvm::sys::path::parent_path(ModuleFilePath));
+}
+
+std::optional<uint64_t>
+getFileContentHash(PathRef FilePath,
+                   llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  auto Buffer = VFS->getBufferForFile(FilePath);
+  if (!Buffer)
+    return std::nullopt;
+  return static_cast<uint64_t>(llvm::xxh3_64bits(Buffer.get()->getBuffer()));
 }
 
 std::string getResolvedModuleSourceIdentity(
@@ -146,11 +298,21 @@ getCompileCommandFingerprint(const tooling::CompileCommand &CompileCommand) {
   }();
   StripOutputArgs->process(CommandLine);
 
-  llvm::hash_code Hash =
-      llvm::hash_combine(CompileCommand.Directory, CompileCommand.Filename);
+  llvm::SmallString<512> FingerprintInput;
+  auto AppendField = [&](llvm::StringRef Field) {
+    FingerprintInput.append(Field);
+    FingerprintInput.push_back('\0');
+  };
+  AppendField(CompileCommand.Directory);
+  AppendField(CompileCommand.Filename);
   for (const auto &Arg : CommandLine)
-    Hash = llvm::hash_combine(Hash, Arg);
-  return std::to_string(static_cast<uint64_t>(Hash));
+    AppendField(Arg);
+  return llvm::utohexstr(llvm::xxh3_64bits(llvm::toStringRef(FingerprintInput)));
+}
+
+void appendStableKeyField(llvm::raw_ostream &OS, llvm::StringRef Field) {
+  OS << Field;
+  OS << '\0';
 }
 
 class SingleViewThreadsafeFS : public ThreadsafeFS {
@@ -213,16 +375,54 @@ void applyModuleBuildInvocationSettings(CompilerInvocation &CI) {
 
   // Hash the contents of input files and preserve comments so reused BMIs match
   // the way clangd originally built them.
+  CI.getHeaderSearchOpts().ModulesValidateSystemHeaders = true;
   CI.getHeaderSearchOpts().ValidateASTInputFilesContent = true;
   CI.getPreprocessorOpts().WriteCommentListToPCH = true;
   CI.getPreprocessorOpts().WriteCommentListToNamedModules = true;
+}
+
+bool hasCompatibleImporterConfiguration(const CompilerInvocation &ModuleBuildCI,
+                                        const CompilerInvocation &ImporterCI) {
+  const auto &ModuleTarget = ModuleBuildCI.getTargetOpts();
+  const auto &ImporterTarget = ImporterCI.getTargetOpts();
+  if (std::tie(ModuleTarget.Triple, ModuleTarget.HostTriple, ModuleTarget.CPU,
+               ModuleTarget.TuneCPU, ModuleTarget.FPMath, ModuleTarget.ABI,
+               ModuleTarget.EABIVersion, ModuleTarget.LinkerVersion,
+               ModuleTarget.FeaturesAsWritten, ModuleTarget.Features,
+               ModuleTarget.ForceEnableInt128,
+               ModuleTarget.NVPTXUseShortPointers,
+               ModuleTarget.CodeObjectVersion,
+               ModuleTarget.AMDGPUPrintfKindVal, ModuleTarget.CodeModel,
+               ModuleTarget.LargeDataThreshold, ModuleTarget.SDKVersion,
+               ModuleTarget.DarwinTargetVariantTriple,
+               ModuleTarget.DarwinTargetVariantSDKVersion,
+               ModuleTarget.DxilValidatorVersion, ModuleTarget.HLSLEntry) !=
+      std::tie(ImporterTarget.Triple, ImporterTarget.HostTriple,
+               ImporterTarget.CPU, ImporterTarget.TuneCPU,
+               ImporterTarget.FPMath, ImporterTarget.ABI,
+               ImporterTarget.EABIVersion, ImporterTarget.LinkerVersion,
+               ImporterTarget.FeaturesAsWritten, ImporterTarget.Features,
+               ImporterTarget.ForceEnableInt128,
+               ImporterTarget.NVPTXUseShortPointers,
+               ImporterTarget.CodeObjectVersion,
+               ImporterTarget.AMDGPUPrintfKindVal, ImporterTarget.CodeModel,
+               ImporterTarget.LargeDataThreshold, ImporterTarget.SDKVersion,
+               ImporterTarget.DarwinTargetVariantTriple,
+               ImporterTarget.DarwinTargetVariantSDKVersion,
+               ImporterTarget.DxilValidatorVersion,
+               ImporterTarget.HLSLEntry))
+    return false;
+
+  return ModuleBuildCI.getFrontendOpts().AuxTriple ==
+         ImporterCI.getFrontendOpts().AuxTriple;
 }
 
 bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
                           const CompilerInvocation *CI,
-                          bool CheckStoredContextHash = true);
+                          bool CheckStoredContextHash = true,
+                          bool AllowFastManifestValidation = true);
 
 // FailedPrerequisiteModules - stands for the PrerequisiteModules which has
 // errors happened during the building process.
@@ -339,28 +539,33 @@ public:
   BuiltModuleFile(StringRef ModuleName, PathRef ModuleFilePath,
                   StringRef ModuleSourceIdentity,
                   StringRef CompileCommandFingerprint,
-                  StringRef RequiredSourceForLookup, CtorTag)
+                  StringRef RequiredSourceForLookup,
+                  bool RemoveOnDestruction, CtorTag)
       : ModuleFile(ModuleName, ModuleFilePath, ModuleSourceIdentity,
-                   CompileCommandFingerprint, RequiredSourceForLookup) {}
+                   CompileCommandFingerprint, RequiredSourceForLookup),
+        RemoveOnDestruction(RemoveOnDestruction) {}
 
   static std::shared_ptr<BuiltModuleFile> make(StringRef ModuleName,
                                                PathRef ModuleFilePath,
                                                StringRef ModuleSourceIdentity,
                                                StringRef CompileCommandHash,
-                                               StringRef RequiredSourceForLookup) {
+                                               StringRef RequiredSourceForLookup,
+                                               bool RemoveOnDestruction = true) {
     return std::make_shared<BuiltModuleFile>(ModuleName, ModuleFilePath,
                                              ModuleSourceIdentity,
                                              CompileCommandHash,
                                              RequiredSourceForLookup,
+                                             RemoveOnDestruction,
                                              CtorTag{});
   }
 
   virtual ~BuiltModuleFile() {
-    if (!ModuleFilePath.empty() && !DebugModulesBuilder) {
-      llvm::sys::fs::remove(ModuleFilePath);
-      llvm::sys::fs::remove(getModuleContextHashFilePath(ModuleFilePath));
-    }
+    if (!ModuleFilePath.empty() && RemoveOnDestruction && !DebugModulesBuilder)
+      removeModuleArtifacts(ModuleFilePath);
   }
+
+private:
+  bool RemoveOnDestruction;
 };
 
 // ReusablePrerequisiteModules - stands for PrerequisiteModules for which all
@@ -457,6 +662,32 @@ public:
 
     return MF->getModuleSourceIdentity() == ModuleSourceIdentity &&
            MF->getCompileCommandFingerprint() == CompileCommandFingerprint;
+  }
+
+  llvm::Error
+  appendStableBuildKey(llvm::raw_ostream &OS,
+                       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) const {
+    llvm::SmallVector<std::tuple<std::string, std::string, uint64_t>, 8>
+        StableEntries;
+    StableEntries.reserve(RequiredModules.size());
+    for (const auto &RequiredModule : RequiredModules) {
+      auto ModuleHash =
+          getFileContentHash(RequiredModule->getModuleFilePath(), VFS);
+      if (!ModuleHash)
+        return llvm::createStringError(
+            llvm::formatv("Failed to hash prerequisite module file {0}",
+                          RequiredModule->getModuleFilePath()));
+      StableEntries.emplace_back(
+          RequiredModule->getModuleName().str(),
+          maybeCaseFoldPath(RequiredModule->getModuleFilePath()), *ModuleHash);
+    }
+    llvm::sort(StableEntries);
+    for (const auto &[ModuleName, ModuleFilePath, ModuleHash] : StableEntries) {
+      appendStableKeyField(OS, ModuleName);
+      appendStableKeyField(OS, ModuleFilePath);
+      appendStableKeyField(OS, llvm::utohexstr(ModuleHash));
+    }
+    return llvm::Error::success();
   }
 
 private:
@@ -633,21 +864,25 @@ private:
       return false;
     applyModuleBuildInvocationSettings(*ValidationCI);
 
-    CompilerInvocation ImportValidationCI(ImporterCI);
-    ImportValidationCI.getPreprocessorOpts() =
-        ValidationCI->getPreprocessorOpts();
-    if (!IsModuleFileUpToDate(MF.getModuleFilePath(), *this, VFS,
-                              &ImportValidationCI,
-                              /*CheckStoredContextHash=*/true))
-      return false;
-
     // Revalidate the BMI against the prerequisite prefix that existed when it
     // was originally built, not the whole final reusable set.
     StaticPrerequisiteModules BuiltBeforeCurrent(
         llvm::ArrayRef<std::shared_ptr<const ModuleFile>>(RequiredModules)
             .take_front(Index));
+    if (!IsModuleFileUpToDate(MF.getModuleFilePath(), BuiltBeforeCurrent, VFS,
+                              ValidationCI.get()))
+      return false;
+
+    if (!hasCompatibleImporterConfiguration(*ValidationCI, ImporterCI))
+      return false;
+
+    // Also validate that the current importer can still load this BMI. Source-
+    // backed modules have fast manifests, so skip that shortcut here and let
+    // ASTReader catch importer-side target/configuration mismatches.
     return IsModuleFileUpToDate(MF.getModuleFilePath(), BuiltBeforeCurrent, VFS,
-                                ValidationCI.get());
+                                &ImporterCI,
+                                /*CheckStoredContextHash=*/false,
+                                /*AllowFastManifestValidation=*/false);
   }
 
   llvm::SmallVector<std::shared_ptr<const ModuleFile>, 8> RequiredModules;
@@ -663,22 +898,88 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
                           const PrerequisiteModules &RequisiteModules,
                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
                           const CompilerInvocation *CI,
-                          bool CheckStoredContextHash) {
-  if (CI)
-    if (auto StoredContextHash = readModuleContextHashFile(ModuleFilePath, VFS);
-        CheckStoredContextHash &&
-            StoredContextHash && *StoredContextHash != CI->computeContextHash())
+                          bool CheckStoredContextHash,
+                          bool AllowFastManifestValidation) {
+  auto ModuleStatus = VFS->status(ModuleFilePath);
+  if (!ModuleStatus || !ModuleStatus->isRegularFile()) {
+    return false;
+  }
+  std::optional<CompilerInvocation> EffectiveCI;
+  if (CI) {
+    EffectiveCI.emplace(*CI);
+    applyModuleBuildInvocationSettings(*EffectiveCI);
+    RequisiteModules.adjustHeaderSearchOptions(
+        EffectiveCI->getHeaderSearchOpts());
+    EffectiveCI->getFrontendOpts().OutputFile = ModuleFilePath.str();
+
+    if (CheckStoredContextHash) {
+      auto StoredContextHash = readModuleContextHashFile(ModuleFilePath, VFS);
+      if (!StoredContextHash)
+        AllowFastManifestValidation = false;
+      else if (*StoredContextHash != EffectiveCI->computeContextHash())
+        return false;
+    }
+  }
+  auto FastManifestInputs = AllowFastManifestValidation
+                                ? readModuleInputManifestFile(ModuleFilePath,
+                                                              VFS)
+                                : std::nullopt;
+  if (FastManifestInputs) {
+    auto CurrentModuleHash = getFileContentHash(ModuleFilePath, VFS);
+    if (!CurrentModuleHash ||
+        *CurrentModuleHash != FastManifestInputs->ModuleFileHash)
       return false;
+
+    for (const auto &Input : FastManifestInputs->Inputs) {
+      auto Status = VFS->status(Input.Path);
+      if (!Status || !Status->isRegularFile()) {
+        return false;
+      }
+
+      if (Input.ContentHash == 0) {
+        return false;
+      }
+
+      auto Buffer = VFS->getBufferForFile(Input.Path);
+      if (!Buffer) {
+        return false;
+      }
+      auto CurrentHash =
+          static_cast<uint64_t>(llvm::xxh3_64bits(Buffer.get()->getBuffer()));
+      if (Input.ContentHash != CurrentHash) {
+        return false;
+      }
+    }
+
+    HeaderSearchOptions CurrentHS;
+    RequisiteModules.adjustHeaderSearchOptions(CurrentHS);
+    for (const auto &Import : FastManifestInputs->Imports) {
+      if (Import.ContentHash == 0)
+        return false;
+
+      if (auto It = CurrentHS.PrebuiltModuleFiles.find(Import.ModuleName);
+          It != CurrentHS.PrebuiltModuleFiles.end() &&
+          maybeCaseFoldPath(It->second) != maybeCaseFoldPath(Import.Path))
+        return false;
+
+      auto CurrentImportHash = getFileContentHash(Import.Path, VFS);
+      if (!CurrentImportHash || *CurrentImportHash != Import.ContentHash)
+        return false;
+    }
+    return true;
+  }
 
   HeaderSearchOptions HSOpts;
   LangOptions LangOpts;
   PreprocessorOptions PPOpts;
-  if (CI) {
-    HSOpts = CI->getHeaderSearchOpts();
-    LangOpts = CI->getLangOpts();
-    PPOpts = CI->getPreprocessorOpts();
+  if (EffectiveCI) {
+    HSOpts = EffectiveCI->getHeaderSearchOpts();
+    LangOpts = EffectiveCI->getLangOpts();
+    PPOpts = EffectiveCI->getPreprocessorOpts();
   }
-  RequisiteModules.adjustHeaderSearchOptions(HSOpts);
+  else
+    RequisiteModules.adjustHeaderSearchOptions(HSOpts);
+  HSOpts.ModulesValidateSystemHeaders = true;
   HSOpts.ForceCheckCXX20ModulesInputFiles = true;
   HSOpts.ValidateASTInputFilesContent = true;
 
@@ -704,7 +1005,14 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
   PCHContainerOperations PCHOperations;
   CodeGenOptions CodeGenOpts;
   ASTReader Reader(PP, *ModCache, /*ASTContext=*/nullptr,
-                   PCHOperations.getRawReader(), CodeGenOpts, {});
+                   PCHOperations.getRawReader(), CodeGenOpts, {},
+                   /*isysroot=*/"",
+                   DisableValidationForModuleKind::None,
+                   /*AllowASTWithCompilerErrors=*/false,
+                   /*AllowConfigurationMismatch=*/false,
+                   HSOpts.ModulesValidateSystemHeaders,
+                   HSOpts.ModulesForceValidateUserHeaders,
+                   HSOpts.ValidateASTInputFilesContent);
 
   // We don't need any listener here. By default it will use a validator
   // listener.
@@ -715,20 +1023,156 @@ bool IsModuleFileUpToDate(PathRef ModuleFilePath,
       ASTReader::ARR_ConfigurationMismatch |
       ASTReader::ARR_TreatModuleWithErrorsAsOutOfDate;
   if (Reader.ReadAST(ModuleFilePath, serialization::MK_MainFile,
-                     SourceLocation(), ValidationCaps) != ASTReader::Success)
+                     SourceLocation(), ValidationCaps) != ASTReader::Success) {
     return false;
+  }
 
   bool UpToDate = true;
   Reader.getModuleManager().visit([&](serialization::ModuleFile &MF) -> bool {
     Reader.visitInputFiles(
-        MF, /*IncludeSystem=*/false, /*Complain=*/false,
+        MF, /*IncludeSystem=*/true, /*Complain=*/false,
         [&](const serialization::InputFile &IF, bool isSystem) {
-          if (!IF.getFile() || IF.isOutOfDate())
+          if (!IF.getFile() || IF.isOutOfDate()) {
             UpToDate = false;
+          }
         });
     return !UpToDate;
   });
   return UpToDate;
+}
+
+bool IsModuleFileFullyUpToDate(
+    PathRef ModuleFilePath, const PrerequisiteModules &RequisiteModules,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+    const CompilerInvocation *CI) {
+  if (!IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS, CI))
+    return false;
+  if (!CI)
+    return true;
+  return IsModuleFileUpToDate(ModuleFilePath, RequisiteModules, VFS, CI,
+                              /*CheckStoredContextHash=*/false,
+                              /*AllowFastManifestValidation=*/false);
+}
+
+llvm::Expected<std::string> getStableModuleVariantFingerprint(
+    llvm::StringRef ModuleSourceIdentity,
+    llvm::StringRef CompileCommandFingerprint,
+    llvm::StringRef ModuleSourceContents,
+    const ReusablePrerequisiteModules &BuiltModuleFiles,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  llvm::SmallString<256> StableKey;
+  llvm::raw_svector_ostream OS(StableKey);
+  appendStableKeyField(OS, maybeCaseFoldPath(ModuleSourceIdentity));
+  appendStableKeyField(OS, CompileCommandFingerprint);
+  appendStableKeyField(
+      OS, llvm::utohexstr(llvm::xxh3_64bits(ModuleSourceContents)));
+  if (llvm::Error Err = BuiltModuleFiles.appendStableBuildKey(OS, VFS))
+    return std::move(Err);
+  return llvm::utohexstr(llvm::xxh3_64bits(OS.str()));
+}
+
+std::optional<ModuleInputManifest>
+collectModuleInputManifest(PathRef ModuleFilePath,
+                           const PrerequisiteModules &RequisiteModules,
+                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
+                           const CompilerInvocation &CI) {
+  HeaderSearchOptions HSOpts = CI.getHeaderSearchOpts();
+  LangOptions LangOpts = CI.getLangOpts();
+  PreprocessorOptions PPOpts = CI.getPreprocessorOpts();
+
+  RequisiteModules.adjustHeaderSearchOptions(HSOpts);
+  HSOpts.ModulesValidateSystemHeaders = true;
+  HSOpts.ForceCheckCXX20ModulesInputFiles = true;
+  HSOpts.ValidateASTInputFilesContent = true;
+  LangOpts.SkipODRCheckInGMF = true;
+
+  clang::clangd::IgnoreDiagnostics IgnoreDiags;
+  DiagnosticOptions DiagOpts;
+  IntrusiveRefCntPtr<DiagnosticsEngine> Diags =
+      CompilerInstance::createDiagnostics(*VFS, DiagOpts, &IgnoreDiags,
+                                          /*ShouldOwnClient=*/false);
+  FileManager FileMgr(FileSystemOptions(), VFS);
+  SourceManager SourceMgr(*Diags, FileMgr);
+  HeaderSearch HeaderInfo(HSOpts, SourceMgr, *Diags, LangOpts,
+                          /*Target=*/nullptr);
+  TrivialModuleLoader ModuleLoader;
+  Preprocessor PP(PPOpts, *Diags, LangOpts, SourceMgr, HeaderInfo,
+                  ModuleLoader);
+
+  std::shared_ptr<ModuleCache> ModCache = createCrossProcessModuleCache();
+  PCHContainerOperations PCHOperations;
+  CodeGenOptions CodeGenOpts;
+  ASTReader Reader(PP, *ModCache, /*ASTContext=*/nullptr,
+                   PCHOperations.getRawReader(), CodeGenOpts, {},
+                   /*isysroot=*/"",
+                   DisableValidationForModuleKind::None,
+                   /*AllowASTWithCompilerErrors=*/false,
+                   /*AllowConfigurationMismatch=*/false,
+                   HSOpts.ModulesValidateSystemHeaders,
+                   HSOpts.ModulesForceValidateUserHeaders,
+                   HSOpts.ValidateASTInputFilesContent);
+  Reader.setListener(nullptr);
+
+  const unsigned ValidationCaps =
+      ASTReader::ARR_OutOfDate | ASTReader::ARR_Missing |
+      ASTReader::ARR_ConfigurationMismatch |
+      ASTReader::ARR_TreatModuleWithErrorsAsOutOfDate;
+  if (Reader.ReadAST(ModuleFilePath, serialization::MK_MainFile,
+                     SourceLocation(), ValidationCaps) != ASTReader::Success)
+    return std::nullopt;
+
+  llvm::StringMap<ModuleInputStamp> UniqueInputs;
+  llvm::StringMap<ModuleImportStamp> UniqueImports;
+  const std::string RootPCMKey = maybeCaseFoldPath(ModuleFilePath);
+  Reader.getModuleManager().visit([&](serialization::ModuleFile &MF) -> bool {
+    if (!MF.ModuleName.empty() && maybeCaseFoldPath(MF.FileName) != RootPCMKey) {
+      auto [It, Inserted] = UniqueImports.try_emplace(MF.ModuleName);
+      if (Inserted) {
+        It->second.ModuleName = MF.ModuleName;
+        It->second.Path = MF.FileName;
+        if (auto ImportHash = getFileContentHash(MF.FileName, VFS))
+          It->second.ContentHash = *ImportHash;
+      }
+    }
+
+    std::vector<serialization::InputFileInfo> InputInfos;
+    Reader.visitInputFileInfos(MF, /*IncludeSystem=*/true,
+                               [&](const serialization::InputFileInfo &IFI,
+                                   bool) { InputInfos.push_back(IFI); });
+    unsigned Index = 0;
+    Reader.visitInputFiles(
+        MF, /*IncludeSystem=*/true, /*Complain=*/false,
+        [&](const serialization::InputFile &IF, bool) {
+          if (Index >= InputInfos.size()) {
+            ++Index;
+            return;
+          }
+          const auto &Info = InputInfos[Index++];
+          auto File = IF.getFile();
+          if (!File)
+            return;
+
+          std::string Key = maybeCaseFoldPath(File->getName());
+          auto [It, Inserted] = UniqueInputs.try_emplace(Key);
+          if (!Inserted)
+            return;
+
+          It->second.Path = File->getName().str();
+          It->second.StoredSize = static_cast<uint64_t>(Info.StoredSize);
+          It->second.StoredTime = static_cast<int64_t>(Info.StoredTime);
+          It->second.ContentHash = Info.ContentHash;
+        });
+    return false;
+  });
+
+  ModuleInputManifest Manifest;
+  Manifest.Inputs.reserve(UniqueInputs.size());
+  for (const auto &Entry : UniqueInputs)
+    Manifest.Inputs.push_back(Entry.second);
+  Manifest.Imports.reserve(UniqueImports.size());
+  for (const auto &Entry : UniqueImports)
+    Manifest.Imports.push_back(Entry.second);
+  return Manifest;
 }
 
 /// Build a module file for module with `ModuleName`. The information of built
@@ -746,31 +1190,60 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
     return llvm::createStringError(
         llvm::formatv("No compile command for {0}", ModuleUnitFileName));
 
-  llvm::SmallString<256> ModuleFilesPrefix =
-      getUniqueModuleFilesPath(ModuleUnitFileName);
-
-  Cmd->Output = getModuleFilePath(ModuleName, ModuleFilesPrefix);
-
   ParseInputs Inputs;
   Inputs.TFS = &TFS;
   Inputs.CompileCommand = std::move(*Cmd);
-
-  IgnoreDiagnostics IgnoreDiags;
-  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
-  if (!CI)
-    return llvm::createStringError("Failed to build compiler invocation");
 
   auto FS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
   auto Buf = FS->getBufferForFile(Inputs.CompileCommand.Filename);
   if (!Buf)
     return llvm::createStringError("Failed to create buffer");
 
+  auto StableModuleVariantFingerprint = getStableModuleVariantFingerprint(
+      ModuleSourceIdentity, CompileCommandFingerprint,
+      Buf.get()->getBuffer(), BuiltModuleFiles, TFS.view(std::nullopt));
+  if (!StableModuleVariantFingerprint)
+    return StableModuleVariantFingerprint.takeError();
+
+  llvm::SmallString<256> StableModuleFilesPath = getStableModuleFilesPath(
+      ModuleUnitFileName, *StableModuleVariantFingerprint);
+  std::string StableOutputPath =
+      getModuleFilePath(ModuleName, StableModuleFilesPath);
+  std::string TemporaryModuleFilesPath =
+      getTemporaryModuleFilesPath(StableModuleFilesPath);
+  std::string TemporaryOutputPath =
+      getModuleFilePath(ModuleName, TemporaryModuleFilesPath);
+  Inputs.CompileCommand.Output = TemporaryOutputPath;
+
+  IgnoreDiagnostics IgnoreDiags;
+  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
+  if (!CI)
+    return llvm::createStringError("Failed to build compiler invocation");
+
+  CI->getFrontendOpts().OutputFile = StableOutputPath;
+  if (IsModuleFileUpToDate(StableOutputPath, BuiltModuleFiles,
+                           TFS.view(std::nullopt), CI.get()) &&
+      IsModuleFileUpToDate(StableOutputPath, BuiltModuleFiles,
+                           TFS.view(std::nullopt), CI.get(),
+                           /*CheckStoredContextHash=*/false,
+                           /*AllowFastManifestValidation=*/false)) {
+    return BuiltModuleFile::make(ModuleName, StableOutputPath,
+                                 ModuleSourceIdentity,
+                                 CompileCommandFingerprint,
+                                 RequiredSourceForLookup,
+                                 /*RemoveOnDestruction=*/false);
+  }
+
   applyModuleBuildInvocationSettings(*CI);
+  CompilerInvocation ValidationCI(*CI);
 
   BuiltModuleFiles.adjustHeaderSearchOptions(CI->getHeaderSearchOpts());
   const std::string ModuleContextHash = CI->computeContextHash();
 
   CI->getFrontendOpts().OutputFile = Inputs.CompileCommand.Output;
+  llvm::scope_exit CleanupTemporaryArtifacts([&] {
+    removeModuleArtifacts(Inputs.CompileCommand.Output);
+  });
   auto Clang =
       prepareCompilerInstance(std::move(CI), /*Preamble=*/nullptr,
                               std::move(*Buf), std::move(FS), IgnoreDiags);
@@ -806,11 +1279,53 @@ buildModuleFile(llvm::StringRef ModuleName, PathRef ModuleUnitFileName,
   }
 
   writeModuleContextHashFile(Inputs.CompileCommand.Output, ModuleContextHash);
+  if (auto Manifest = collectModuleInputManifest(
+          Inputs.CompileCommand.Output, BuiltModuleFiles,
+          TFS.view(std::nullopt), Clang->getInvocation())) {
+    if (auto ModuleFileHash = getFileContentHash(Inputs.CompileCommand.Output,
+                                                 TFS.view(std::nullopt))) {
+      Manifest->ModuleFileHash = *ModuleFileHash;
+      writeModuleInputManifestFile(Inputs.CompileCommand.Output, *Manifest);
+    }
+  }
 
-  return BuiltModuleFile::make(ModuleName, Inputs.CompileCommand.Output,
-                               ModuleSourceIdentity,
-                               CompileCommandFingerprint,
-                               RequiredSourceForLookup);
+  auto ReusePublishedStableOutput = [&]() {
+    return BuiltModuleFile::make(ModuleName, StableOutputPath,
+                                 ModuleSourceIdentity,
+                                 CompileCommandFingerprint,
+                                 RequiredSourceForLookup,
+                                 /*RemoveOnDestruction=*/false);
+  };
+  auto ReuseTemporaryOutput = [&]() {
+    CleanupTemporaryArtifacts.release();
+    return BuiltModuleFile::make(ModuleName, TemporaryOutputPath,
+                                 ModuleSourceIdentity,
+                                 CompileCommandFingerprint,
+                                 RequiredSourceForLookup,
+                                 /*RemoveOnDestruction=*/true);
+  };
+
+  if (IsModuleFileFullyUpToDate(StableOutputPath, BuiltModuleFiles,
+                                TFS.view(std::nullopt), &ValidationCI))
+    return ReusePublishedStableOutput();
+
+  std::error_code PublishEC =
+      llvm::sys::fs::rename(TemporaryModuleFilesPath, StableModuleFilesPath);
+  if (!PublishEC) {
+    CleanupTemporaryArtifacts.release();
+    return ReusePublishedStableOutput();
+  }
+
+  if (llvm::sys::fs::exists(StableOutputPath) &&
+      IsModuleFileFullyUpToDate(StableOutputPath, BuiltModuleFiles,
+                                TFS.view(std::nullopt), &ValidationCI))
+    return ReusePublishedStableOutput();
+
+  vlog("Failed to publish shared module cache directory {0} for module {1}: "
+       "{2}. Keeping builder-local artifact {3}",
+       StableModuleFilesPath, ModuleName, PublishEC.message(),
+       TemporaryOutputPath);
+  return ReuseTemporaryOutput();
 }
 
 bool ReusablePrerequisiteModules::canReuse(
@@ -839,8 +1354,29 @@ bool ReusablePrerequisiteModules::canReuse(
     const auto &MF = *RequiredModules[I];
 
     if (MF.getModuleSourceIdentity().empty()) {
+      PathRef RequiredSource = MF.getRequiredSourceForLookup().empty()
+                                   ? MainFile
+                                   : MF.getRequiredSourceForLookup();
+      std::string ModuleUnitFileName =
+          ProjectModules->getSourceForModuleName(MF.getModuleName(),
+                                                 RequiredSource);
+      if (!ModuleUnitFileName.empty()) {
+        auto Cmd = CDB->getCompileCommand(ModuleUnitFileName);
+        if (!Cmd)
+          return false;
+
+        auto ValidationCI = buildCompilerInvocationForCommand(*Cmd, VFS);
+        if (!ValidationCI)
+          return false;
+        applyModuleBuildInvocationSettings(*ValidationCI);
+
+        if (!hasCompatibleImporterConfiguration(*ValidationCI, CI))
+          return false;
+      }
+
       if (!IsModuleFileUpToDate(MF.getModuleFilePath(), *this, VFS, &CI,
-                                /*CheckStoredContextHash=*/false))
+                                /*CheckStoredContextHash=*/true,
+                                /*AllowFastManifestValidation=*/false))
         return false;
       continue;
     }
@@ -904,6 +1440,43 @@ ModuleFileCache &getGlobalModuleFileCache() {
   static ModuleFileCache Cache;
   return Cache;
 }
+
+class PrerequisiteModulesCache {
+public:
+  std::shared_ptr<const ReusablePrerequisiteModules>
+  getReusable(PathRef MainFile, const CompilerInvocation &CI,
+              llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+    std::vector<std::shared_ptr<const ReusablePrerequisiteModules>> Candidates;
+    {
+      std::lock_guard<std::mutex> Lock(CacheMutex);
+      auto It = Cache.find(maybeCaseFoldPath(MainFile));
+      if (It == Cache.end())
+        return nullptr;
+      Candidates.assign(It->second.begin(), It->second.end());
+    }
+
+    for (auto It = Candidates.rbegin(); It != Candidates.rend(); ++It)
+      if ((*It)->canReuse(CI, VFS))
+        return *It;
+    return nullptr;
+  }
+
+  void add(PathRef MainFile,
+           std::shared_ptr<const ReusablePrerequisiteModules> Modules) {
+    std::lock_guard<std::mutex> Lock(CacheMutex);
+    auto &Entries = Cache[maybeCaseFoldPath(MainFile)];
+    Entries.push_back(std::move(Modules));
+    if (Entries.size() > 4)
+      Entries.erase(Entries.begin(),
+                    Entries.begin() + (Entries.size() - 4));
+  }
+
+private:
+  std::mutex CacheMutex;
+  llvm::StringMap<
+      llvm::SmallVector<std::shared_ptr<const ReusablePrerequisiteModules>, 2>>
+      Cache;
+};
 
 class ModuleNameToSourceCache {
 public:
@@ -1028,6 +1601,9 @@ public:
     return ProjectModulesCache;
   }
   const GlobalCompilationDatabase &getCDB() const { return CDB; }
+  PrerequisiteModulesCache &getPrerequisiteModulesCache() {
+    return PrerequisiteCache;
+  }
 
   llvm::Error
   getOrBuildModuleFile(PathRef RequiredSource, StringRef ModuleName,
@@ -1048,6 +1624,7 @@ private:
                                      ReusablePrerequisiteModules &BuiltModuleFiles);
 
   ModuleFileCache &Cache;
+  PrerequisiteModulesCache PrerequisiteCache;
   ModuleNameToSourceCache ProjectModulesCache;
 };
 
@@ -1077,8 +1654,8 @@ void ModulesBuilder::ModulesBuilderImpl::getPrebuiltModuleFile(
     if (BuiltModuleFiles.isModuleUnitBuilt(ModuleName))
       continue;
 
-    if (IsModuleFileUpToDate(ModuleFilePath, BuiltModuleFiles,
-                             TFS.view(std::nullopt), CI.get())) {
+    if (IsModuleFileFullyUpToDate(ModuleFilePath, BuiltModuleFiles,
+                                  TFS.view(std::nullopt), CI.get())) {
       log("Reusing prebuilt module file {0} of module {1} for {2}",
           ModuleFilePath, ModuleName, ModuleUnitFileName);
       BuiltModuleFiles.addModuleFile(
@@ -1110,8 +1687,8 @@ bool ModulesBuilder::ModulesBuilderImpl::getExplicitPrebuiltModuleFile(
   if (It == CI->getHeaderSearchOpts().PrebuiltModuleFiles.end())
     return false;
 
-  if (!IsModuleFileUpToDate(It->second, BuiltModuleFiles,
-                            TFS.view(std::nullopt), CI.get()))
+  if (!IsModuleFileFullyUpToDate(It->second, BuiltModuleFiles,
+                                 TFS.view(std::nullopt), CI.get()))
     return false;
 
   log("Reusing explicit prebuilt module file {0} of module {1} for {2}",
@@ -1136,8 +1713,9 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
                 ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.find(
                     ModuleName);
             It != ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.end() &&
-            IsModuleFileUpToDate(It->second, BuiltModuleFiles,
-                                 TFS.view(std::nullopt), ValidationCI.get())) {
+            IsModuleFileFullyUpToDate(It->second, BuiltModuleFiles,
+                                      TFS.view(std::nullopt),
+                                      ValidationCI.get())) {
           if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
                   ModuleName, ValidationCI.get(),
                   /*ModuleSourceIdentity=*/"",
@@ -1203,8 +1781,9 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
                   ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.find(
                       ReqModuleName);
               It != ValidationCI->getHeaderSearchOpts().PrebuiltModuleFiles.end() &&
-              IsModuleFileUpToDate(It->second, BuiltModuleFiles,
-                                   TFS.view(std::nullopt), ValidationCI.get())) {
+              IsModuleFileFullyUpToDate(It->second, BuiltModuleFiles,
+                                        TFS.view(std::nullopt),
+                                        ValidationCI.get())) {
             if (!BuiltModuleFiles.matchesBuiltModuleConfiguration(
                     ReqModuleName, ValidationCI.get(),
                     /*ModuleSourceIdentity=*/"",
@@ -1238,8 +1817,9 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
           Cached->getModuleSourceIdentity() == ReqConfig.SourceIdentity &&
           Cached->getCompileCommandFingerprint() ==
               ReqConfig.CommandFingerprint &&
-          IsModuleFileUpToDate(Cached->getModuleFilePath(), BuiltModuleFiles,
-                               TFS.view(std::nullopt), ReqConfig.CI.get())) {
+          IsModuleFileFullyUpToDate(Cached->getModuleFilePath(),
+                                    BuiltModuleFiles, TFS.view(std::nullopt),
+                                    ReqConfig.CI.get())) {
         log("Reusing module {0} from {1}", ReqModuleName,
             Cached->getModuleFilePath());
         BuiltModuleFiles.recordRequiredSourceForLookup(ReqModuleName,
@@ -1280,6 +1860,15 @@ llvm::Error ModulesBuilder::ModulesBuilderImpl::getOrBuildModuleFile(
 std::unique_ptr<PrerequisiteModules>
 ModulesBuilder::buildPrerequisiteModulesFor(PathRef File,
                                             const ThreadsafeFS &TFS) {
+  if (auto Cmd = Impl->getCDB().getCompileCommand(File)) {
+    auto ValidationCI =
+        buildCompilerInvocationForCommand(*Cmd, TFS.view(std::nullopt));
+    if (ValidationCI)
+      if (auto Cached = Impl->getPrerequisiteModulesCache().getReusable(
+              File, *ValidationCI, TFS.view(std::nullopt)))
+        return std::make_unique<ReusablePrerequisiteModules>(*Cached);
+  }
+
   std::unique_ptr<ProjectModules> MDB = Impl->getCDB().getProjectModules(File);
   if (!MDB) {
     elog("Failed to get Project Modules information for {0}", File);
@@ -1304,6 +1893,9 @@ ModulesBuilder::buildPrerequisiteModulesFor(PathRef File,
     }
   }
 
+  Impl->getPrerequisiteModulesCache().add(
+      File,
+      std::make_shared<ReusablePrerequisiteModules>(*RequiredModules));
   return std::move(RequiredModules);
 }
 
