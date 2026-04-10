@@ -1342,6 +1342,42 @@ void foo() {}
 }
 
 TEST_F(PrerequisiteModulesTests,
+       NonModularPreambleCompatibilityKeepsNaturalBounds) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("Header.hpp", R"cpp(
+#define HAS_PREAMBLE 1
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+void foo() {}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Use.Contents, getFullPath("Use.cpp")), 0);
+  ASSERT_GT(NaturalPreambleBounds.Size, 0u);
+
+  auto Preamble =
+      buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
+                    /*Callback=*/nullptr);
+  ASSERT_TRUE(Preamble);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, NaturalPreambleBounds.Size);
+  EXPECT_FALSE(
+      bypassedPreambleForModules(Use, *Preamble, NaturalPreambleBounds));
+  EXPECT_TRUE(isPreambleCompatible(*Preamble, Use, getFullPath("Use.cpp"), *CI));
+}
+
+TEST_F(PrerequisiteModulesTests,
        ModulesPreambleCompatibilityRejectsStaleRequiredModules) {
   SameNameSourceSwitchingCompilationDatabase CDB(TestDir, FS);
 

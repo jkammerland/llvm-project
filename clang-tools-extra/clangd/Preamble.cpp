@@ -32,10 +32,12 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TokenKinds.h"
+#include "clang/DependencyScanning/DependencyScanningService.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/PrecompiledPreamble.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -43,6 +45,7 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "clang/Tooling/DependencyScanningTool.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
@@ -572,20 +575,91 @@ static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
                                                  llvm::MemoryBufferRef Buffer) {
   auto Bounds = ComputePreambleBounds(CI.getLangOpts(), Buffer, 0);
   // Imports inside headers included by the preamble aren't reliably reflected
-  // in the patched main AST under experimental modules support. Keep the
-  // preamble empty in that mode so such imports are parsed in the main AST.
-  // TODO: Benchmark first-open and incremental-edit latency before narrowing
-  // this workaround. The likely risk is on modules-enabled TUs with ordinary
-  // textual includes, where disabling preamble reuse can make repeated edits
-  // more expensive; module-heavy TUs may see little change.
+  // in the patched main AST under experimental modules support. Only bypass
+  // the preamble when the current file or its dependency scan actually
+  // indicates named-module usage; preserving natural preambles for ordinary
+  // textual includes avoids paying the modules workaround on unrelated edits.
   if (shouldBypassPreambleForModules(Inputs, Bounds))
     return {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
   return Bounds;
 }
 
+static bool lexicallyLooksLikeModulesManagedFile(llvm::StringRef Contents,
+                                                 PreambleBounds Bounds) {
+  if (Bounds.Size >= Contents.size())
+    return false;
+
+  llvm::StringRef Suffix = Contents.drop_front(Bounds.Size);
+  SourceLocation Start;
+  LangOptions LexLangOpts;
+  Lexer Lex(Start, LexLangOpts, Suffix.begin(), Suffix.begin(), Suffix.end());
+  Lex.SetKeepWhitespaceMode(false);
+  Lex.SetCommentRetentionState(false);
+
+  Token Tok;
+  while (!Lex.LexFromRawLexer(Tok)) {
+    if (!Tok.is(tok::raw_identifier))
+      continue;
+    llvm::StringRef Identifier = Tok.getRawIdentifier();
+    if (Tok.isAtStartOfLine() &&
+        (Identifier == "import" || Identifier == "module"))
+      return true;
+    if (!Tok.isAtStartOfLine() || Identifier != "export")
+      continue;
+
+    Token Next;
+    if (!Lex.LexFromRawLexer(Next) && Next.is(tok::raw_identifier) &&
+        Next.getRawIdentifier() == "module")
+      return true;
+  }
+
+  return false;
+}
+
+static std::optional<bool>
+dependencyScanShowsNamedModules(const ParseInputs &Inputs) {
+  if (!Inputs.TFS)
+    return std::nullopt;
+
+  dependencies::DependencyScanningServiceOptions Opts;
+  Opts.MakeVFS = [&] { return Inputs.TFS->view(std::nullopt); };
+  Opts.Mode = dependencies::ScanningMode::CanonicalPreprocessing;
+  Opts.Format = dependencies::ScanningOutputFormat::P1689;
+  dependencies::DependencyScanningService Service(Opts);
+
+  tooling::DependencyScanningTool ScanningTool(Service);
+  std::string ScanDiags;
+  llvm::raw_string_ostream DiagOS(ScanDiags);
+  DiagnosticOptions DiagOpts;
+  DiagOpts.ShowCarets = false;
+  TextDiagnosticPrinter DiagConsumer(DiagOS, DiagOpts);
+
+  std::optional<tooling::P1689Rule> ScanResult =
+      ScanningTool.getP1689ModuleDependencyFile(Inputs.CompileCommand,
+                                                Inputs.CompileCommand.Directory,
+                                                DiagConsumer);
+  if (!ScanResult) {
+    vlog("Skipping modules preamble bypass after failed dependency scan for "
+         "{0}: {1}",
+         Inputs.CompileCommand.Filename, llvm::StringRef(ScanDiags).trim());
+    return std::nullopt;
+  }
+
+  return ScanResult->Provides || !ScanResult->Requires.empty();
+}
+
 bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
                                     PreambleBounds NaturalBounds) {
-  return Inputs.ModulesManager && NaturalBounds.Size != 0;
+  if (!Inputs.ModulesManager || NaturalBounds.Size == 0)
+    return false;
+
+  if (lexicallyLooksLikeModulesManagedFile(Inputs.Contents, NaturalBounds))
+    return true;
+
+  if (auto UsesNamedModules = dependencyScanShowsNamedModules(Inputs))
+    return *UsesNamedModules;
+
+  return false;
 }
 
 bool bypassedPreambleForModules(const ParseInputs &Inputs,
