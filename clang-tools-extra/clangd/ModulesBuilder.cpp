@@ -853,9 +853,6 @@ bool ReusablePrerequisiteModules::canReuse(
 
 class ModuleFileCache {
 public:
-  ModuleFileCache(const GlobalCompilationDatabase &CDB) : CDB(CDB) {}
-  const GlobalCompilationDatabase &getCDB() const { return CDB; }
-
   std::shared_ptr<const ModuleFile> getModule(StringRef ModuleName,
                                               PathRef ModuleUnitSourcePath);
 
@@ -864,15 +861,13 @@ public:
     std::lock_guard<std::mutex> Lock(ModuleFilesMutex);
 
     ModuleFiles[ModuleName][maybeCaseFoldPath(ModuleUnitSourcePath)] =
-        ModuleFile;
+        std::move(ModuleFile);
   }
 
   void remove(StringRef ModuleName, PathRef ModuleUnitSourcePath);
 
 private:
-  const GlobalCompilationDatabase &CDB;
-
-  llvm::StringMap<llvm::StringMap<std::weak_ptr<const ModuleFile>>> ModuleFiles;
+  llvm::StringMap<llvm::StringMap<std::shared_ptr<const ModuleFile>>> ModuleFiles;
   // Mutex to guard accesses to ModuleFiles.
   std::mutex ModuleFilesMutex;
 };
@@ -889,14 +884,7 @@ ModuleFileCache::getModule(StringRef ModuleName, PathRef ModuleUnitSourcePath) {
   auto SourceIt = It->second.find(SourcePathKey);
   if (SourceIt == It->second.end())
     return nullptr;
-
-  if (auto Res = SourceIt->second.lock())
-    return Res;
-
-  It->second.erase(SourceIt);
-  if (It->second.empty())
-    ModuleFiles.erase(It);
-  return nullptr;
+  return SourceIt->second;
 }
 
 void ModuleFileCache::remove(StringRef ModuleName,
@@ -910,6 +898,11 @@ void ModuleFileCache::remove(StringRef ModuleName,
   It->second.erase(maybeCaseFoldPath(ModuleUnitSourcePath));
   if (It->second.empty())
     ModuleFiles.erase(It);
+}
+
+ModuleFileCache &getGlobalModuleFileCache() {
+  static ModuleFileCache Cache;
+  return Cache;
 }
 
 class ModuleNameToSourceCache {
@@ -1028,12 +1021,13 @@ getAllRequiredModules(PathRef RequiredSource, CachingProjectModules &MDB,
 
 class ModulesBuilder::ModulesBuilderImpl {
 public:
-  ModulesBuilderImpl(const GlobalCompilationDatabase &CDB) : Cache(CDB) {}
+  ModulesBuilderImpl(const GlobalCompilationDatabase &CDB)
+      : CDB(CDB), Cache(getGlobalModuleFileCache()) {}
 
   ModuleNameToSourceCache &getProjectModulesCache() {
     return ProjectModulesCache;
   }
-  const GlobalCompilationDatabase &getCDB() const { return Cache.getCDB(); }
+  const GlobalCompilationDatabase &getCDB() const { return CDB; }
 
   llvm::Error
   getOrBuildModuleFile(PathRef RequiredSource, StringRef ModuleName,
@@ -1041,6 +1035,7 @@ public:
                        ReusablePrerequisiteModules &BuiltModuleFiles);
 
 private:
+  const GlobalCompilationDatabase &CDB;
   /// Try to get prebuilt module files from the compilation database.
   void getPrebuiltModuleFile(StringRef ModuleName, PathRef ModuleUnitFileName,
                              const ThreadsafeFS &TFS,
@@ -1052,7 +1047,7 @@ private:
                                      const ThreadsafeFS &TFS,
                                      ReusablePrerequisiteModules &BuiltModuleFiles);
 
-  ModuleFileCache Cache;
+  ModuleFileCache &Cache;
   ModuleNameToSourceCache ProjectModulesCache;
 };
 

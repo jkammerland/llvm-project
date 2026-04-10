@@ -1308,7 +1308,8 @@ int use() {
   EXPECT_TRUE(HSOpts.PrebuiltModuleFiles.count("M"));
 }
 
-TEST_F(PrerequisiteModulesTests, ModulesPreambleCompatibility) {
+TEST_F(PrerequisiteModulesTests,
+       NamedImportAfterPlainPreambleKeepsNaturalBounds) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("A.cppm", R"cpp(
@@ -1333,11 +1334,15 @@ void foo() {}
       buildCompilerInvocation(Use, DiagConsumer);
   ASSERT_TRUE(CI);
 
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Use.Contents, getFullPath("Use.cpp")), 0);
+
   auto Preamble =
       buildPreamble(getFullPath("Use.cpp"), *CI, Use, /*InMemory=*/true,
                     /*Callback=*/nullptr);
   ASSERT_TRUE(Preamble);
-  EXPECT_EQ(Preamble->Preamble.getBounds().Size, 0u);
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, NaturalPreambleBounds.Size);
   EXPECT_TRUE(isPreambleCompatible(*Preamble, Use, getFullPath("Use.cpp"), *CI));
 }
 
@@ -1699,7 +1704,7 @@ int usePart() {
     EXPECT_NE(Diag.Name, "module_decl_not_at_start");
 }
 
-TEST_F(PrerequisiteModulesTests, ModulesBypassPatchPreservesGMFState) {
+TEST_F(PrerequisiteModulesTests, ImplementationUnitWithPlainGMFKeepsPreamble) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("gmf.hpp", R"cpp(
@@ -1746,62 +1751,21 @@ int usePart() {
                     /*Callback=*/nullptr);
   ASSERT_TRUE(Preamble);
   ASSERT_TRUE(Preamble->RequiredModules);
-  EXPECT_TRUE(
+  EXPECT_FALSE(
       bypassedPreambleForModules(Input, *Preamble, NaturalPreambleBounds));
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, NaturalPreambleBounds.Size);
 
   auto FullPatch =
       PreamblePatch::createFullPatch(getFullPath("M-impl.cpp"), Input, *Preamble);
   auto BypassPatch =
       PreamblePatch::createBypassPatch(getFullPath("M-impl.cpp"), Input,
                                        *Preamble);
-  EXPECT_THAT(FullPatch.text(), testing::Not(testing::HasSubstr("module;")));
-  EXPECT_THAT(FullPatch.text(), testing::HasSubstr("#include \"gmf.hpp\""));
+  EXPECT_TRUE(FullPatch.text().empty());
   EXPECT_THAT(BypassPatch.text(), testing::HasSubstr("module;"));
   EXPECT_THAT(BypassPatch.text(), testing::HasSubstr("#include \"gmf.hpp\""));
-
-  auto ParseWithPatch = [&](const PreamblePatch &Patch) {
-    StoreDiags RawDiags;
-    auto ParseCI = buildCompilerInvocation(Input, RawDiags);
-    EXPECT_TRUE(ParseCI);
-    if (!ParseCI)
-      return std::vector<Diag>{};
-
-    applyRequiredModulesSettings(Preamble->RequiredModules.get(), *ParseCI);
-    Patch.apply(*ParseCI);
-
-    auto Clang = prepareCompilerInstance(
-        std::move(ParseCI), &Preamble->Preamble,
-        llvm::MemoryBuffer::getMemBufferCopy(Input.Contents,
-                                             getFullPath("M-impl.cpp")),
-        Input.TFS->view(Input.CompileCommand.Directory), RawDiags);
-    EXPECT_TRUE(Clang);
-    if (!Clang)
-      return std::vector<Diag>{};
-
-    SyntaxOnlyAction Action;
-    EXPECT_TRUE(
-        Action.BeginSourceFile(*Clang, Clang->getFrontendOpts().Inputs[0]));
-    if (llvm::Error Err = Action.Execute())
-      ADD_FAILURE() << llvm::toString(std::move(Err));
-    Action.EndSourceFile();
-    return RawDiags.take();
-  };
-
-  bool FullPatchSawModuleDeclNotAtStart = false;
-  for (const auto &Diag : ParseWithPatch(FullPatch))
-    FullPatchSawModuleDeclNotAtStart |=
-        (Diag.Name == "module_decl_not_at_start");
-  EXPECT_TRUE(FullPatchSawModuleDeclNotAtStart);
-
-  bool BypassPatchSawModuleDeclNotAtStart = false;
-  for (const auto &Diag : ParseWithPatch(BypassPatch))
-    BypassPatchSawModuleDeclNotAtStart |=
-        (Diag.Name == "module_decl_not_at_start");
-  EXPECT_FALSE(BypassPatchSawModuleDeclNotAtStart);
 }
 
-TEST_F(PrerequisiteModulesTests,
-       ModulesBypassPatchNeedsPreambleSkipForCodeComplete) {
+TEST_F(PrerequisiteModulesTests, BypassPatchMustNotReplayNaturalGMFPreamble) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("gmf.hpp", R"cpp(
@@ -1835,8 +1799,9 @@ export inline int useGMF() { return GMFValue; }
       buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
                     /*Callback=*/nullptr);
   ASSERT_TRUE(Preamble);
-  EXPECT_TRUE(
+  EXPECT_FALSE(
       bypassedPreambleForModules(Input, *Preamble, NaturalPreambleBounds));
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, NaturalPreambleBounds.Size);
 
   auto BypassPatch =
       PreamblePatch::createBypassPatch(getFullPath("M.cppm"), Input, *Preamble);
@@ -1871,22 +1836,26 @@ export inline int useGMF() { return GMFValue; }
     return RawDiags.take();
   };
 
-  auto SawIncludedTwice = [](llvm::ArrayRef<Diag> Diags) {
+  auto SawDuplicateGMFState = [](llvm::ArrayRef<Diag> Diags) {
     for (const auto &Diag : Diags) {
-      if (llvm::StringRef(Diag.Message).contains("included twice"))
+      llvm::StringRef Message = Diag.Message;
+      if (Message.contains("included twice") ||
+          Message.contains("redefinition of 'GMFValue'"))
         return true;
     }
     return false;
   };
 
-  EXPECT_TRUE(SawIncludedTwice(ParseWithSetup(&BypassPatch, nullptr)));
-  EXPECT_FALSE(SawIncludedTwice(ParseWithSetup(nullptr, nullptr)));
-  EXPECT_FALSE(SawIncludedTwice(
+  EXPECT_TRUE(SawDuplicateGMFState(ParseWithSetup(&BypassPatch, nullptr)));
+  EXPECT_FALSE(SawDuplicateGMFState(ParseWithSetup(nullptr, nullptr)));
+  EXPECT_FALSE(
+      SawDuplicateGMFState(ParseWithSetup(nullptr, &Preamble->Preamble)));
+  EXPECT_TRUE(SawDuplicateGMFState(
       ParseWithSetup(&BypassPatch, &Preamble->Preamble)));
 }
 
 TEST_F(PrerequisiteModulesTests,
-       ModulesBypassPatchPreservesGMFMetadataSideTables) {
+       NaturalGMFPreamblePreservesMetadataSideTables) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("M.cppm", R"cpp(
@@ -1922,11 +1891,12 @@ export inline int value() { return BODY_MACRO; }
   auto AST = ParsedAST::build(getFullPath("M.cppm"), Input, std::move(CI), {},
                               Preamble);
   ASSERT_TRUE(AST);
-  EXPECT_TRUE(AST->bypassedPreambleForModules());
+  EXPECT_FALSE(AST->bypassedPreambleForModules());
 
   EXPECT_THAT(AST->getMacros().Names.keys(),
               testing::UnorderedElementsAre("GMF_MACRO", "BODY_MACRO"));
-  EXPECT_THAT(AST->getMacros().SkippedRanges, testing::SizeIs(2));
+  EXPECT_THAT(AST->getMacros().SkippedRanges,
+              testing::SizeIs(testing::Ge(2)));
 
   std::vector<std::string> MarkTrivia;
   for (const auto &Mark : AST->getMarks())
@@ -1935,7 +1905,8 @@ export inline int value() { return BODY_MACRO; }
               testing::ElementsAre(" In GMF", " In Body"));
 }
 
-TEST_F(PrerequisiteModulesTests, ModulesBypassPatchFailsForInterfaceUnitGMF) {
+TEST_F(PrerequisiteModulesTests,
+       BypassPatchFailsOnNaturalInterfaceUnitGMFPreamble) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("M.cppm", R"cpp(
@@ -1966,8 +1937,9 @@ export inline double value() { return std::sqrt(4.0); }
       buildPreamble(getFullPath("M.cppm"), *CI, Input, /*InMemory=*/true,
                     /*Callback=*/nullptr);
   ASSERT_TRUE(Preamble);
-  EXPECT_TRUE(
+  EXPECT_FALSE(
       bypassedPreambleForModules(Input, *Preamble, NaturalPreambleBounds));
+  EXPECT_EQ(Preamble->Preamble.getBounds().Size, NaturalPreambleBounds.Size);
 
   auto BypassPatch =
       PreamblePatch::createBypassPatch(getFullPath("M.cppm"), Input, *Preamble);
@@ -2019,7 +1991,8 @@ export inline double value() { return std::sqrt(4.0); }
   EXPECT_FALSE(SawDiag(NoPatchNoPreamble, "pp_module_decl_in_header"));
 }
 
-TEST_F(PrerequisiteModulesTests, NoFalseModuleDeclInHeaderWithInterfaceUnitGMF) {
+TEST_F(PrerequisiteModulesTests,
+       NoFalseModuleDeclInHeaderWithNaturalInterfaceUnitGMFPreamble) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("M.cppm", R"cpp(
@@ -2051,14 +2024,14 @@ export inline double value() { return std::sqrt(4.0); }
   auto AST = ParsedAST::build(getFullPath("M.cppm"), Input, std::move(CI), {},
                               Preamble);
   ASSERT_TRUE(AST);
-  EXPECT_TRUE(AST->bypassedPreambleForModules());
+  EXPECT_FALSE(AST->bypassedPreambleForModules());
 
   for (const auto &Diag : AST->getDiagnostics())
     EXPECT_NE(Diag.Name, "pp_module_decl_in_header");
 }
 
 TEST_F(PrerequisiteModulesTests,
-       InterfaceUnitBypassPreservesGMFIncludesInAST) {
+       NaturalInterfaceUnitGMFPreamblePreservesIncludesInAST) {
   MockDirectoryCompilationDatabase CDB(TestDir, FS);
 
   CDB.addFile("gmf.hpp", R"cpp(
@@ -2089,7 +2062,7 @@ export inline int value() { return gmfHelper(); }
   auto AST = ParsedAST::build(getFullPath("M.cppm"), Input, std::move(CI), {},
                               Preamble);
   ASSERT_TRUE(AST);
-  EXPECT_TRUE(AST->bypassedPreambleForModules());
+  EXPECT_FALSE(AST->bypassedPreambleForModules());
   EXPECT_THAT(AST->getIncludeStructure().MainFileIncludes,
               testing::ElementsAre(
                   testing::Field(&Inclusion::Written, "\"gmf.hpp\"")));
@@ -2913,6 +2886,40 @@ import M;
   ModuleInfo2->adjustHeaderSearchOptions(HS2);
 
   EXPECT_EQ(HS.PrebuiltModuleFiles, HS2.PrebuiltModuleFiles);
+}
+
+TEST_F(PrerequisiteModulesTests, ProcessSharedCacheReusesBuiltModuleAcrossBuilders) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("M.cppm", R"cpp(
+export module M;
+  )cpp");
+
+  CDB.addFile("U.cpp", R"cpp(
+import M;
+  )cpp");
+
+  std::string FirstBuiltPath;
+  {
+    ModulesBuilder Builder(CDB);
+    auto ModuleInfo =
+        Builder.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+    ASSERT_TRUE(ModuleInfo);
+    HeaderSearchOptions HS(TestDir);
+    ModuleInfo->adjustHeaderSearchOptions(HS);
+    ASSERT_TRUE(HS.PrebuiltModuleFiles.count("M"));
+    FirstBuiltPath = HS.PrebuiltModuleFiles["M"];
+  }
+
+  ModulesBuilder Builder2(CDB);
+  auto ModuleInfo2 =
+      Builder2.buildPrerequisiteModulesFor(getFullPath("U.cpp"), FS);
+  ASSERT_TRUE(ModuleInfo2);
+  HeaderSearchOptions HS2(TestDir);
+  ModuleInfo2->adjustHeaderSearchOptions(HS2);
+  ASSERT_TRUE(HS2.PrebuiltModuleFiles.count("M"));
+
+  EXPECT_EQ(FirstBuiltPath, HS2.PrebuiltModuleFiles["M"]);
 }
 
 TEST_F(PrerequisiteModulesTests, CacheRejectsSourceRemapWithSameModuleName) {

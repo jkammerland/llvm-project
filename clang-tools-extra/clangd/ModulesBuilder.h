@@ -8,12 +8,10 @@
 //
 // Experimental support for C++20 Modules.
 //
-// Currently we simplify the implementations by preventing reusing module files
-// across different versions and different source files. But this is clearly a
-// waste of time and space in the end of the day.
-//
-// TODO: Supporting reusing module files across different versions and
-// different source files.
+// clangd reuses built module files within the current process across document
+// versions and requiring source files when their validation keys still match.
+// The cache is intentionally process-local; cross-process persistence is future
+// work.
 //
 //===----------------------------------------------------------------------===//
 

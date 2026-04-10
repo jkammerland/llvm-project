@@ -32,12 +32,10 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/TokenKinds.h"
-#include "clang/DependencyScanning/DependencyScanningService.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/PrecompiledPreamble.h"
-#include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
@@ -45,7 +43,6 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Tooling/CompilationDatabase.h"
-#include "clang/Tooling/DependencyScanningTool.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
@@ -575,47 +572,48 @@ static PreambleBounds getPreambleBoundsForInputs(const ParseInputs &Inputs,
                                                  const CompilerInvocation &CI,
                                                  llvm::MemoryBufferRef Buffer) {
   auto Bounds = ComputePreambleBounds(CI.getLangOpts(), Buffer, 0);
-  // Imports inside headers included by the preamble aren't reliably reflected
-  // in the patched main AST under experimental modules support. Only bypass
-  // the preamble when the current file or its dependency scan actually
-  // indicates named-module usage; preserving natural preambles for ordinary
-  // textual includes avoids paying the modules workaround on unrelated edits.
+  // Imports or module declarations inside the reusable preamble region aren't
+  // reliably reflected in the patched main AST under experimental modules
+  // support. Keep a natural preamble for ordinary GMF/header text and only
+  // fall back to a zero-length preamble when the reusable prefix itself looks
+  // module-managed.
   if (shouldBypassPreambleForModules(Inputs, Bounds))
     return {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true};
   return Bounds;
 }
 
-static bool lexicallyLooksLikeModulesManagedFile(llvm::StringRef Contents,
-                                                 PreambleBounds Bounds) {
-  if (Bounds.Size >= Contents.size())
+static bool lexicallyLooksLikeModulesManagedText(llvm::StringRef Contents) {
+  if (Contents.empty())
     return false;
-
-  llvm::StringRef Suffix = Contents.drop_front(Bounds.Size);
-  SourceLocation Start;
-  LangOptions LexLangOpts;
-  Lexer Lex(Start, LexLangOpts, Suffix.begin(), Suffix.begin(), Suffix.end());
-  Lex.SetKeepWhitespaceMode(false);
-  Lex.SetCommentRetentionState(false);
-
-  Token Tok;
-  while (!Lex.LexFromRawLexer(Tok)) {
-    if (!Tok.is(tok::raw_identifier))
+  llvm::SmallVector<llvm::StringRef, 32> Lines;
+  Contents.split(Lines, '\n');
+  for (llvm::StringRef Line : Lines) {
+    llvm::StringRef Trimmed = Line.ltrim();
+    if (Trimmed.empty())
       continue;
-    llvm::StringRef Identifier = Tok.getRawIdentifier();
-    if (Tok.isAtStartOfLine() &&
-        (Identifier == "import" || Identifier == "module"))
+    if (Trimmed.starts_with("//") || Trimmed.starts_with("/*") ||
+        Trimmed.starts_with("*"))
+      continue;
+    if (Trimmed.starts_with("import"))
       return true;
-    if (!Tok.isAtStartOfLine() || Identifier != "export")
+    if (Trimmed.consume_front("module")) {
+      Trimmed = Trimmed.ltrim();
+      if (!Trimmed.starts_with(";"))
+        return true;
       continue;
-
-    Token Next;
-    if (!Lex.LexFromRawLexer(Next) && Next.is(tok::raw_identifier) &&
-        (Next.getRawIdentifier() == "module" ||
-         Next.getRawIdentifier() == "import"))
+    }
+    if (Trimmed.starts_with("export module") ||
+        Trimmed.starts_with("export import"))
       return true;
   }
 
   return false;
+}
+
+static bool preambleRegionLexicallyLooksModular(llvm::StringRef Contents,
+                                                PreambleBounds Bounds) {
+  return Bounds.Size != 0 &&
+         lexicallyLooksLikeModulesManagedText(Contents.take_front(Bounds.Size));
 }
 
 struct ParsedIncludeDirective {
@@ -797,8 +795,7 @@ static bool preambleIncludesLexicallyLookModular(const ParseInputs &Inputs,
       continue;
 
     llvm::StringRef Contents = (*Buffer)->getBuffer();
-    if (lexicallyLooksLikeModulesManagedFile(
-            Contents, {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true}))
+    if (lexicallyLooksLikeModulesManagedText(Contents))
       return true;
 
     EnqueueIncludes(collectSpelledIncludes(Contents), Current);
@@ -806,48 +803,13 @@ static bool preambleIncludesLexicallyLookModular(const ParseInputs &Inputs,
   return false;
 }
 
-static std::optional<bool>
-dependencyScanShowsNamedModules(const ParseInputs &Inputs) {
-  if (!Inputs.TFS)
-    return std::nullopt;
-
-  dependencies::DependencyScanningServiceOptions Opts;
-  Opts.MakeVFS = [&] { return Inputs.TFS->view(std::nullopt); };
-  Opts.Mode = dependencies::ScanningMode::CanonicalPreprocessing;
-  Opts.Format = dependencies::ScanningOutputFormat::P1689;
-  dependencies::DependencyScanningService Service(Opts);
-
-  tooling::DependencyScanningTool ScanningTool(Service);
-  std::string ScanDiags;
-  llvm::raw_string_ostream DiagOS(ScanDiags);
-  DiagnosticOptions DiagOpts;
-  DiagOpts.ShowCarets = false;
-  TextDiagnosticPrinter DiagConsumer(DiagOS, DiagOpts);
-
-  std::optional<tooling::P1689Rule> ScanResult =
-      ScanningTool.getP1689ModuleDependencyFile(Inputs.CompileCommand,
-                                                Inputs.CompileCommand.Directory,
-                                                DiagConsumer);
-  if (!ScanResult) {
-    vlog("Skipping modules preamble bypass after failed dependency scan for "
-         "{0}: {1}",
-         Inputs.CompileCommand.Filename, llvm::StringRef(ScanDiags).trim());
-    return std::nullopt;
-  }
-
-  return ScanResult->Provides || !ScanResult->Requires.empty();
-}
-
 bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
                                     PreambleBounds NaturalBounds) {
   if (!Inputs.ModulesManager || NaturalBounds.Size == 0)
     return false;
 
-  if (lexicallyLooksLikeModulesManagedFile(Inputs.Contents, NaturalBounds))
+  if (preambleRegionLexicallyLooksModular(Inputs.Contents, NaturalBounds))
     return true;
-
-  if (auto UsesNamedModules = dependencyScanShowsNamedModules(Inputs))
-    return *UsesNamedModules;
 
   return preambleIncludesLexicallyLookModular(Inputs, NaturalBounds);
 }
