@@ -55,6 +55,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -609,10 +610,199 @@ static bool lexicallyLooksLikeModulesManagedFile(llvm::StringRef Contents,
 
     Token Next;
     if (!Lex.LexFromRawLexer(Next) && Next.is(tok::raw_identifier) &&
-        Next.getRawIdentifier() == "module")
+        (Next.getRawIdentifier() == "module" ||
+         Next.getRawIdentifier() == "import"))
       return true;
   }
 
+  return false;
+}
+
+struct ParsedIncludeDirective {
+  std::string Header;
+  bool Angled = false;
+};
+
+struct IncludeSearchRoots {
+  llvm::SmallVector<std::string, 8> QuoteRoots;
+  llvm::SmallVector<std::string, 16> AngledRoots;
+};
+
+static std::string makeAbsolutePath(llvm::StringRef Path,
+                                    llvm::StringRef WorkingDir) {
+  llvm::SmallString<256> Absolute;
+  if (llvm::sys::path::is_absolute(Path)) {
+    Absolute = Path;
+  } else {
+    Absolute = WorkingDir;
+    llvm::sys::path::append(Absolute, Path);
+  }
+  llvm::sys::path::remove_dots(Absolute, /*remove_dot_dot=*/true);
+  return std::string(Absolute);
+}
+
+static void appendSearchRoot(llvm::SmallVectorImpl<std::string> &Roots,
+                             llvm::StringRef Path,
+                             llvm::StringRef WorkingDir) {
+  if (Path.empty())
+    return;
+  std::string Absolute = makeAbsolutePath(Path, WorkingDir);
+  if (!llvm::is_contained(Roots, Absolute))
+    Roots.push_back(std::move(Absolute));
+}
+
+static IncludeSearchRoots
+collectIncludeSearchRoots(const tooling::CompileCommand &Cmd) {
+  IncludeSearchRoots Roots;
+  for (size_t I = 0; I < Cmd.CommandLine.size(); ++I) {
+    llvm::StringRef Arg = Cmd.CommandLine[I];
+    auto ConsumePathArg =
+        [&](llvm::StringRef Flag,
+            llvm::SmallVectorImpl<std::string> &Destination) -> bool {
+      if (Arg == Flag) {
+        if (I + 1 >= Cmd.CommandLine.size())
+          return true;
+        appendSearchRoot(Destination, Cmd.CommandLine[++I], Cmd.Directory);
+        return true;
+      }
+      if (!Arg.starts_with(Flag) || Arg.size() == Flag.size())
+        return false;
+      appendSearchRoot(Destination, Arg.drop_front(Flag.size()), Cmd.Directory);
+      return true;
+    };
+    if (ConsumePathArg("-iquote", Roots.QuoteRoots) ||
+        ConsumePathArg("-I", Roots.AngledRoots) ||
+        ConsumePathArg("-isystem", Roots.AngledRoots) ||
+        ConsumePathArg("-idirafter", Roots.AngledRoots))
+      continue;
+  }
+  return Roots;
+}
+
+static std::optional<ParsedIncludeDirective>
+parseIncludeDirective(llvm::StringRef Line) {
+  llvm::StringRef Rest = Line.ltrim();
+  if (!Rest.consume_front("#"))
+    return std::nullopt;
+  Rest = Rest.ltrim();
+  if (!(Rest.consume_front("include_next") || Rest.consume_front("include") ||
+        Rest.consume_front("import")))
+    return std::nullopt;
+  if (!Rest.empty() && !llvm::isSpace(Rest.front()))
+    return std::nullopt;
+  Rest = Rest.ltrim();
+  if (Rest.empty())
+    return std::nullopt;
+
+  ParsedIncludeDirective Include;
+  char Close = 0;
+  if (Rest.front() == '"') {
+    Include.Angled = false;
+    Close = '"';
+  } else if (Rest.front() == '<') {
+    Include.Angled = true;
+    Close = '>';
+  } else {
+    return std::nullopt;
+  }
+
+  Rest = Rest.drop_front();
+  size_t End = Rest.find(Close);
+  if (End == llvm::StringRef::npos)
+    return std::nullopt;
+  Include.Header = Rest.take_front(End).str();
+  return Include;
+}
+
+static llvm::SmallVector<ParsedIncludeDirective, 8>
+collectSpelledIncludes(llvm::StringRef Contents,
+                       std::optional<PreambleBounds> Bounds = std::nullopt) {
+  if (Bounds)
+    Contents =
+        Contents.take_front(std::min<size_t>(Bounds->Size, Contents.size()));
+
+  llvm::SmallVector<ParsedIncludeDirective, 8> Includes;
+  llvm::SmallVector<llvm::StringRef, 32> Lines;
+  Contents.split(Lines, '\n');
+  for (llvm::StringRef Line : Lines)
+    if (auto Include = parseIncludeDirective(Line))
+      Includes.push_back(std::move(*Include));
+  return Includes;
+}
+
+static std::optional<std::string>
+resolveInclude(const ParsedIncludeDirective &Include, llvm::StringRef Including,
+               const IncludeSearchRoots &Roots,
+               llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) {
+  auto TryResolve = [&](llvm::StringRef Root) -> std::optional<std::string> {
+    llvm::SmallString<256> Candidate(Root);
+    llvm::sys::path::append(Candidate, Include.Header);
+    llvm::sys::path::remove_dots(Candidate, /*remove_dot_dot=*/true);
+    llvm::ErrorOr<llvm::vfs::Status> Status = VFS->status(Candidate);
+    if (!Status || !Status->isRegularFile())
+      return std::nullopt;
+    return std::string(Candidate);
+  };
+
+  if (!Include.Angled)
+    if (auto Resolved =
+            TryResolve(llvm::sys::path::parent_path(Including)))
+      return Resolved;
+
+  if (!Include.Angled)
+    for (llvm::StringRef Root : Roots.QuoteRoots)
+      if (auto Resolved = TryResolve(Root))
+        return Resolved;
+  for (llvm::StringRef Root : Roots.AngledRoots)
+    if (auto Resolved = TryResolve(Root))
+      return Resolved;
+  return std::nullopt;
+}
+
+static bool preambleIncludesLexicallyLookModular(const ParseInputs &Inputs,
+                                                 PreambleBounds NaturalBounds) {
+  if (!Inputs.TFS || Inputs.CompileCommand.Filename.empty())
+    return false;
+
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS =
+      Inputs.TFS->view(Inputs.CompileCommand.Directory);
+  IncludeSearchRoots SearchRoots = collectIncludeSearchRoots(Inputs.CompileCommand);
+  std::string MainFile = makeAbsolutePath(Inputs.CompileCommand.Filename,
+                                          Inputs.CompileCommand.Directory);
+  llvm::SmallVector<std::string> Pending;
+  llvm::StringSet<> SeenFiles;
+
+  auto EnqueueIncludes =
+      [&](llvm::ArrayRef<ParsedIncludeDirective> Includes,
+          llvm::StringRef IncludingFile) {
+        for (const ParsedIncludeDirective &Include : Includes) {
+          auto Resolved =
+              resolveInclude(Include, IncludingFile, SearchRoots, VFS);
+          if (!Resolved)
+            continue;
+          if (!SeenFiles.insert(*Resolved).second)
+            continue;
+          Pending.push_back(std::move(*Resolved));
+        }
+      };
+
+  EnqueueIncludes(collectSpelledIncludes(Inputs.Contents, NaturalBounds),
+                  MainFile);
+
+  while (!Pending.empty()) {
+    std::string Current = std::move(Pending.pop_back_val());
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buffer =
+        VFS->getBufferForFile(Current);
+    if (!Buffer)
+      continue;
+
+    llvm::StringRef Contents = (*Buffer)->getBuffer();
+    if (lexicallyLooksLikeModulesManagedFile(
+            Contents, {/*Size=*/0, /*PreambleEndsAtStartOfLine=*/true}))
+      return true;
+
+    EnqueueIncludes(collectSpelledIncludes(Contents), Current);
+  }
   return false;
 }
 
@@ -659,7 +849,7 @@ bool shouldBypassPreambleForModules(const ParseInputs &Inputs,
   if (auto UsesNamedModules = dependencyScanShowsNamedModules(Inputs))
     return *UsesNamedModules;
 
-  return false;
+  return preambleIncludesLexicallyLookModular(Inputs, NaturalBounds);
 }
 
 bool bypassedPreambleForModules(const ParseInputs &Inputs,

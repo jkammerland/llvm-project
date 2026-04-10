@@ -1378,6 +1378,80 @@ void foo() {}
 }
 
 TEST_F(PrerequisiteModulesTests,
+       IncludeDrivenImportStillBypassesAfterDependencyScanFailure) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("A.cppm", R"cpp(
+export module A;
+export void printA();
+  )cpp");
+  CDB.addFile("Import.hpp", R"cpp(
+import A;
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+#include "Import.hpp"
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+void foo() {
+  printA();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Use.Contents, getFullPath("Use.cpp")), 0);
+  ASSERT_GT(NaturalPreambleBounds.Size, 0u);
+
+  Use.CompileCommand.CommandLine.push_back("-invalid-unknown-flag");
+  EXPECT_TRUE(shouldBypassPreambleForModules(Use, NaturalPreambleBounds));
+}
+
+TEST_F(PrerequisiteModulesTests,
+       NonModularHeadersKeepNaturalBoundsAfterDependencyScanFailure) {
+  MockDirectoryCompilationDatabase CDB(TestDir, FS);
+
+  CDB.addFile("Import.hpp", R"cpp(
+inline int value() { return 1; }
+  )cpp");
+  CDB.addFile("Header.hpp", R"cpp(
+#include "Import.hpp"
+  )cpp");
+  CDB.addFile("Use.cpp", R"cpp(
+#include "Header.hpp"
+int use() {
+  return value();
+}
+  )cpp");
+
+  ModulesBuilder Builder(CDB);
+
+  ParseInputs Use = getInputs("Use.cpp", CDB);
+  Use.ModulesManager = &Builder;
+
+  std::unique_ptr<CompilerInvocation> CI =
+      buildCompilerInvocation(Use, DiagConsumer);
+  ASSERT_TRUE(CI);
+
+  const auto NaturalPreambleBounds = ComputePreambleBounds(
+      CI->getLangOpts(),
+      llvm::MemoryBufferRef(Use.Contents, getFullPath("Use.cpp")), 0);
+  ASSERT_GT(NaturalPreambleBounds.Size, 0u);
+
+  Use.CompileCommand.CommandLine.push_back("-invalid-unknown-flag");
+  EXPECT_FALSE(shouldBypassPreambleForModules(Use, NaturalPreambleBounds));
+}
+
+TEST_F(PrerequisiteModulesTests,
        ModulesPreambleCompatibilityRejectsStaleRequiredModules) {
   SameNameSourceSwitchingCompilationDatabase CDB(TestDir, FS);
 
