@@ -844,7 +844,7 @@ static bool preambleIncludesLexicallyLookModular(
                   MainFile);
 
   while (!Pending.empty()) {
-    std::string Current = std::move(Pending.pop_back_val());
+    std::string Current = Pending.pop_back_val();
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buffer =
         VFS->getBufferForFile(Current);
     if (!Buffer)
